@@ -64,10 +64,21 @@ class Camera(nn.Module):
         self.trans = trans
         self.scale = scale
 
-        self.world_view_transform = torch.tensor(getWorld2View2(R, T, trans, scale)).transpose(0, 1).cuda()
-        self.projection_matrix = getProjectionMatrix(znear=self.znear, zfar=self.zfar, fovX=self.FoVx, fovY=self.FoVy).transpose(0,1).cuda()
-        self.full_proj_transform = (self.world_view_transform.unsqueeze(0).bmm(self.projection_matrix.unsqueeze(0))).squeeze(0)
-        self.camera_center = self.world_view_transform.inverse()[3, :3]
+        matrix_device = torch.device("cuda" if torch.cuda.is_available() else self.data_device)
+        world_view_transform = torch.tensor(getWorld2View2(R, T, trans, scale)).transpose(0, 1)
+        projection_matrix = getProjectionMatrix(
+            znear=self.znear,
+            zfar=self.zfar,
+            fovX=self.FoVx,
+            fovY=self.FoVy,
+        ).transpose(0, 1)
+        full_proj_transform = world_view_transform.matmul(projection_matrix)
+        camera_center = world_view_transform.inverse()[3, :3]
+
+        self.world_view_transform = world_view_transform.to(matrix_device)
+        self.projection_matrix = projection_matrix.to(matrix_device)
+        self.full_proj_transform = full_proj_transform.to(matrix_device)
+        self.camera_center = camera_center.to(matrix_device)
 
 class MiniCam:
     def __init__(self, width, height, fovy, fovx, znear, zfar, world_view_transform, full_proj_transform):
@@ -81,4 +92,3 @@ class MiniCam:
         self.full_proj_transform = full_proj_transform
         view_inv = torch.inverse(self.world_view_transform)
         self.camera_center = view_inv[3][:3]
-

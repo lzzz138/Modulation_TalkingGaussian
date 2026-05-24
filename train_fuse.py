@@ -27,11 +27,11 @@ from arguments import ModelParams, PipelineParams, OptimizationParams
 from utils.camera_utils import loadCamOnTheFly
 import copy
 
-try:
+SummaryWriter = None
+TENSORBOARD_FOUND = False
+if os.environ.get('TALKING_GAUSSIAN_TENSORBOARD') == '1':
     from torch.utils.tensorboard import SummaryWriter
     TENSORBOARD_FOUND = True
-except ImportError:
-    TENSORBOARD_FOUND = False
 
 def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from):
     opt.iterations = 10000
@@ -234,7 +234,7 @@ def prepare_output_and_logger(args):
 
 def training_report(tb_writer, iteration, testing_iterations, image, gt_image):
     # Report test and samples of training set
-    if iteration in testing_iterations:
+    if tb_writer and iteration in testing_iterations:
         tb_writer.add_images("fuse/render", image[None], global_step=iteration)
         tb_writer.add_images("fuse/ground_truth", gt_image[None], global_step=iteration)
 

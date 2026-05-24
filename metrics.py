@@ -1,4 +1,5 @@
 import cv2
+import os
 import sys
 import lpips
 import numpy as np
@@ -24,10 +25,29 @@ class LMDMeter:
         else:
 
             import face_alignment
+            torch_load = torch.load
+
+            def compatible_torch_load(*args, **kwargs):
+                kwargs.pop('weights_only', None)
+                return torch_load(*args, **kwargs)
+
+            torch.load = compatible_torch_load
+            device = 'cuda' if torch.cuda.is_available() else 'cpu'
             try:
-                self.predictor = face_alignment.FaceAlignment(face_alignment.LandmarksType._2D, flip_input=False)
-            except:
-                self.predictor = face_alignment.FaceAlignment(face_alignment.LandmarksType.TWO_D, flip_input=False)
+                try:
+                    self.predictor = face_alignment.FaceAlignment(
+                        face_alignment.LandmarksType._2D,
+                        flip_input=False,
+                        device=device,
+                    )
+                except AttributeError:
+                    self.predictor = face_alignment.FaceAlignment(
+                        face_alignment.LandmarksType.TWO_D,
+                        flip_input=False,
+                        device=device,
+                    )
+            finally:
+                torch.load = torch_load
 
         self.V = 0
         self.N = 0
@@ -46,8 +66,11 @@ class LMDMeter:
                 break
 
         else:
-            lms = self.predictor.get_landmarks(img)[-1]
-        
+            preds = self.predictor.get_landmarks(img)
+            if preds is None:
+                return None
+            lms = preds[-1]
+
         # self.vis_landmarks(img, lms)
         lms = lms.astype(np.float32)
 
@@ -77,6 +100,8 @@ class LMDMeter:
         # get lms
         lms_pred = self.get_landmarks(preds)
         lms_truth = self.get_landmarks(truths)
+        if lms_pred is None or lms_truth is None:
+            return
 
         if self.region == 'mouth':
             lms_pred = lms_pred[48:68]
@@ -85,7 +110,7 @@ class LMDMeter:
         # avarage
         lms_pred = lms_pred - lms_pred.mean(0)
         lms_truth = lms_truth - lms_truth.mean(0)
-        
+
         # distance
         dist = np.sqrt(((lms_pred - lms_truth) ** 2).sum(1)).mean(0)
         
@@ -175,44 +200,42 @@ class LPIPSMeter:
     def report(self):
         return f'LPIPS ({self.net}) = {self.measure():.6f}'
 
+if __name__ == "__main__":
+    lmd_meter = LMDMeter(backend='fan')
+    psnr_meter = PSNRMeter()
+    lpips_meter = LPIPSMeter()
 
+    lmd_meter.clear()
+    psnr_meter.clear()
+    lpips_meter.clear()
 
+    vid_path_1 = sys.argv[1]
+    vid_path_2 = sys.argv[2]
 
-lmd_meter = LMDMeter(backend='fan')
-psnr_meter = PSNRMeter()
-lpips_meter = LPIPSMeter()
+    capture_1 = cv2.VideoCapture(vid_path_1)
+    capture_2 = cv2.VideoCapture(vid_path_2)
 
-lmd_meter.clear()
-psnr_meter.clear()
-lpips_meter.clear()
+    counter = 0
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    while True:
+        ret_1, frame_1 = capture_1.read()
+        ret_2, frame_2 = capture_2.read()
 
-vid_path_1 = sys.argv[1]
-vid_path_2 = sys.argv[2]
+        if not ret_1 * ret_2:
+            break
 
-capture_1 = cv2.VideoCapture(vid_path_1)
-capture_2 = cv2.VideoCapture(vid_path_2)
+        # plt.imshow(frame_1[:, :, ::-1])
+        # plt.show()
+        inp_1 = torch.FloatTensor(frame_1[..., ::-1] / 255.0)[None, ...].to(device)
+        inp_2 = torch.FloatTensor(frame_2[..., ::-1] / 255.0)[None, ...].to(device)
+        lmd_meter.update(inp_1, inp_2)
+        psnr_meter.update(inp_1, inp_2)
+        lpips_meter.update(inp_1, inp_2)
 
-counter = 0
-while True:
-    ret_1, frame_1 = capture_1.read()
-    ret_2, frame_2 = capture_2.read()
+        counter+=1
+        if counter % 100 == 0:
+            print(counter)
 
-    if not ret_1 * ret_2:
-        break
-    
-    # plt.imshow(frame_1[:, :, ::-1])
-    # plt.show()
-    inp_1 = torch.FloatTensor(frame_1[..., ::-1] / 255.0)[None, ...].cuda()
-    inp_2 = torch.FloatTensor(frame_2[..., ::-1] / 255.0)[None, ...].cuda()
-    lmd_meter.update(inp_1, inp_2)
-    psnr_meter.update(inp_1, inp_2)
-    lpips_meter.update(inp_1, inp_2)
-
-    counter+=1
-    if counter % 100 == 0:
-        print(counter)
-
-print(lmd_meter.report())
-print(psnr_meter.report())
-print(lpips_meter.report())
-
+    print(lmd_meter.report())
+    print(psnr_meter.report())
+    print(lpips_meter.report())

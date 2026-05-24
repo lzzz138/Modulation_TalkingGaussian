@@ -107,7 +107,10 @@ def readCamerasFromTransforms(path, transformsfile, white_background, extension=
         frames = contents["frames"]
         
         if audio_file == '':
-            aud_features = np.load(os.path.join(path, 'aud_{}.npy'.format(postfix_dict[audio_extractor])))
+            audio_path = os.path.join(path, 'aud_{}.npy'.format(postfix_dict[audio_extractor]))
+            if audio_extractor == 'deepspeech' and not os.path.exists(audio_path):
+                audio_path = os.path.join(path, 'aud.npy')
+            aud_features = np.load(audio_path)
         else:
             aud_features = np.load(audio_file)
         aud_features = torch.from_numpy(aud_features)

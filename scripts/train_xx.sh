@@ -1,3 +1,5 @@
+set -euo pipefail
+
 dataset=$1
 workspace=$2
 gpu_id=$3

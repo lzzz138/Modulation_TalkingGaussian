@@ -3,14 +3,88 @@ import glob
 import tqdm
 import json
 import argparse
+import shlex
+import shutil
+import subprocess
+import sys
 import cv2
 import numpy as np
 
-def extract_audio(path, out_path, sample_rate=16000):
+
+def run_command(cmd):
+    print(f'[INFO] running: {" ".join(shlex.quote(str(c)) for c in cmd)}', flush=True)
+    subprocess.run(cmd, check=True)
+
+
+def validate_ffmpeg(ffmpeg):
+    try:
+        subprocess.run(
+            [ffmpeg, '-version'],
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            universal_newlines=True,
+        )
+    except FileNotFoundError:
+        raise RuntimeError(f'ffmpeg executable not found: {ffmpeg}')
+    except subprocess.CalledProcessError as e:
+        err = (e.stderr or '').strip().splitlines()
+        detail = err[0] if err else f'exit code {e.returncode}'
+        raise RuntimeError(
+            f'ffmpeg is not runnable ({ffmpeg}): {detail}\n'
+            'Install a working ffmpeg or pass one with --ffmpeg /path/to/ffmpeg '
+            '(or set FFMPEG=/path/to/ffmpeg).'
+        )
+
+
+def resolve_ffmpeg(ffmpeg=None):
+    if ffmpeg:
+        validate_ffmpeg(ffmpeg)
+        return ffmpeg
+
+    candidates = []
+    path_ffmpeg = shutil.which('ffmpeg')
+    if path_ffmpeg:
+        candidates.append(path_ffmpeg)
+    if os.path.exists('/usr/bin/ffmpeg'):
+        candidates.append('/usr/bin/ffmpeg')
+
+    seen = set()
+    last_error = None
+    for candidate in candidates:
+        if candidate in seen:
+            continue
+        seen.add(candidate)
+        try:
+            validate_ffmpeg(candidate)
+            if last_error is not None:
+                print(f'[INFO] using fallback ffmpeg: {candidate}', flush=True)
+            return candidate
+        except RuntimeError as e:
+            last_error = e
+            print(f'[WARN] {str(e).splitlines()[0]}', flush=True)
+
+    if last_error is not None:
+        raise last_error
+    raise RuntimeError(
+        'ffmpeg executable not found. Install ffmpeg or pass one with '
+        '--ffmpeg /path/to/ffmpeg (or set FFMPEG=/path/to/ffmpeg).'
+    )
+
+
+def require_files(paths, description):
+    if not paths:
+        raise RuntimeError(
+            f'No files found for {description}. Previous preprocessing step likely failed.'
+        )
+
+
+def extract_audio(path, out_path, ffmpeg='ffmpeg', sample_rate=16000):
     
     print(f'[INFO] ===== extract audio from {path} to {out_path} =====')
-    cmd = f'ffmpeg -i {path} -f wav -ar {sample_rate} {out_path}'
-    os.system(cmd)
+    run_command([
+        ffmpeg, '-y', '-i', path, '-f', 'wav', '-ar', str(sample_rate), out_path
+    ])
     print(f'[INFO] ===== extracted audio =====')
 
 
@@ -18,27 +92,34 @@ def extract_audio_features(path, mode='wav2vec'):
 
     print(f'[INFO] ===== extract audio labels for {path} =====')
     if mode == 'wav2vec':
-        cmd = f'python nerf/asr.py --wav {path} --save_feats'
+        cmd = [sys.executable, 'nerf/asr.py', '--wav', path, '--save_feats']
     else: # deepspeech
-        cmd = f'python data_utils/deepspeech_features/extract_ds_features.py --input {path}'
-    os.system(cmd)
+        cmd = [
+            sys.executable, 'data_utils/deepspeech_features/extract_ds_features.py',
+            '--input', path
+        ]
+    run_command(cmd)
     print(f'[INFO] ===== extracted audio labels =====')
 
 
 
-def extract_images(path, out_path, fps=25):
+def extract_images(path, out_path, ffmpeg='ffmpeg', fps=25):
 
     print(f'[INFO] ===== extract images from {path} to {out_path} =====')
-    cmd = f'ffmpeg -i {path} -vf fps={fps} -qmin 1 -q:v 1 -start_number 0 {os.path.join(out_path, "%d.jpg")}'
-    os.system(cmd)
+    run_command([
+        ffmpeg, '-y', '-i', path, '-vf', f'fps={fps}', '-qmin', '1',
+        '-q:v', '1', '-start_number', '0', os.path.join(out_path, '%d.jpg')
+    ])
     print(f'[INFO] ===== extracted images =====')
 
 
 def extract_semantics(ori_imgs_dir, parsing_dir):
 
     print(f'[INFO] ===== extract semantics from {ori_imgs_dir} to {parsing_dir} =====')
-    cmd = f'python data_utils/face_parsing/test.py --respath={parsing_dir} --imgpath={ori_imgs_dir}'
-    os.system(cmd)
+    run_command([
+        sys.executable, 'data_utils/face_parsing/test.py',
+        f'--respath={parsing_dir}', f'--imgpath={ori_imgs_dir}'
+    ])
     print(f'[INFO] ===== extracted semantics =====')
 
 
@@ -47,19 +128,43 @@ def extract_landmarks(ori_imgs_dir):
     print(f'[INFO] ===== extract face landmarks from {ori_imgs_dir} =====')
 
     import face_alignment
+    import torch
+
+    # face_alignment>=1.5 passes weights_only=True, but this repo uses torch 1.12.
+    # Keep the compatibility shim local to landmark extraction.
+    torch_load = torch.load
+
+    def compatible_torch_load(*args, **kwargs):
+        kwargs.pop('weights_only', None)
+        return torch_load(*args, **kwargs)
+
+    torch.load = compatible_torch_load
     try:
-        fa = face_alignment.FaceAlignment(face_alignment.LandmarksType._2D, flip_input=False)
-    except:
-        fa = face_alignment.FaceAlignment(face_alignment.LandmarksType.TWO_D, flip_input=False)
-    image_paths = glob.glob(os.path.join(ori_imgs_dir, '*.jpg'))
-    for image_path in tqdm.tqdm(image_paths):
-        input = cv2.imread(image_path, cv2.IMREAD_UNCHANGED) # [H, W, 3]
-        input = cv2.cvtColor(input, cv2.COLOR_BGR2RGB)
-        preds = fa.get_landmarks(input)
-        if len(preds) > 0:
-            lands = preds[0].reshape(-1, 2)[:,:2]
-            np.savetxt(image_path.replace('jpg', 'lms'), lands, '%f')
-    del fa
+        device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        try:
+            fa = face_alignment.FaceAlignment(
+                face_alignment.LandmarksType._2D,
+                flip_input=False,
+                device=device,
+            )
+        except AttributeError:
+            fa = face_alignment.FaceAlignment(
+                face_alignment.LandmarksType.TWO_D,
+                flip_input=False,
+                device=device,
+            )
+        image_paths = sorted(glob.glob(os.path.join(ori_imgs_dir, '*.jpg')))
+        require_files(image_paths, f'face landmarks in {ori_imgs_dir}')
+        for image_path in tqdm.tqdm(image_paths):
+            input = cv2.imread(image_path, cv2.IMREAD_UNCHANGED) # [H, W, 3]
+            input = cv2.cvtColor(input, cv2.COLOR_BGR2RGB)
+            preds = fa.get_landmarks(input)
+            if preds is not None and len(preds) > 0:
+                lands = preds[0].reshape(-1, 2)[:,:2]
+                np.savetxt(image_path.replace('jpg', 'lms'), lands, '%f')
+        del fa
+    finally:
+        torch.load = torch_load
     print(f'[INFO] ===== extracted face landmarks =====')
 
 
@@ -69,7 +174,8 @@ def extract_background(base_dir, ori_imgs_dir):
 
     from sklearn.neighbors import NearestNeighbors
 
-    image_paths = glob.glob(os.path.join(ori_imgs_dir, '*.jpg'))
+    image_paths = sorted(glob.glob(os.path.join(ori_imgs_dir, '*.jpg')))
+    require_files(image_paths, f'background extraction in {ori_imgs_dir}')
     # only use 1/20 image_paths 
     image_paths = image_paths[::20]
     # read one image to get H/W
@@ -129,7 +235,8 @@ def extract_torso_and_gt(base_dir, ori_imgs_dir):
     # load bg
     bg_image = cv2.imread(os.path.join(base_dir, 'bc.jpg'), cv2.IMREAD_UNCHANGED)
     
-    image_paths = glob.glob(os.path.join(ori_imgs_dir, '*.jpg'))
+    image_paths = sorted(glob.glob(os.path.join(ori_imgs_dir, '*.jpg')))
+    require_files(image_paths, f'torso/gt extraction in {ori_imgs_dir}')
 
     for image_path in tqdm.tqdm(image_paths):
         # read ori image
@@ -246,15 +353,20 @@ def face_tracking(ori_imgs_dir):
 
     print(f'[INFO] ===== perform face tracking =====')
 
-    image_paths = glob.glob(os.path.join(ori_imgs_dir, '*.jpg'))
+    image_paths = sorted(glob.glob(os.path.join(ori_imgs_dir, '*.jpg')))
+    require_files(image_paths, f'face tracking in {ori_imgs_dir}')
     
     # read one image to get H/W
     tmp_image = cv2.imread(image_paths[0], cv2.IMREAD_UNCHANGED) # [H, W, 3]
     h, w = tmp_image.shape[:2]
 
-    cmd = f'python data_utils/face_tracking/face_tracker.py --path={ori_imgs_dir} --img_h={h} --img_w={w} --frame_num={len(image_paths)}'
+    cmd = [
+        sys.executable, 'data_utils/face_tracking/face_tracker.py',
+        f'--path={ori_imgs_dir}', f'--img_h={h}', f'--img_w={w}',
+        f'--frame_num={len(image_paths)}'
+    ]
 
-    os.system(cmd)
+    run_command(cmd)
 
     print(f'[INFO] ===== finished face tracking =====')
 
@@ -264,7 +376,8 @@ def save_transforms(base_dir, ori_imgs_dir):
 
     import torch
 
-    image_paths = glob.glob(os.path.join(ori_imgs_dir, '*.jpg'))
+    image_paths = sorted(glob.glob(os.path.join(ori_imgs_dir, '*.jpg')))
+    require_files(image_paths, f'saving transforms in {ori_imgs_dir}')
     
     # read one image to get H/W
     tmp_image = cv2.imread(image_paths[0], cv2.IMREAD_UNCHANGED) # [H, W, 3]
@@ -350,6 +463,12 @@ if __name__ == '__main__':
     parser.add_argument('path', type=str, help="path to video file")
     parser.add_argument('--task', type=int, default=-1, help="-1 means all")
     parser.add_argument('--asr', type=str, default='deepspeech', help="wav2vec or deepspeech")
+    parser.add_argument(
+        '--ffmpeg',
+        type=str,
+        default=os.environ.get('FFMPEG'),
+        help="path to ffmpeg executable",
+    )
 
     opt = parser.parse_args()
 
@@ -366,40 +485,44 @@ if __name__ == '__main__':
     os.makedirs(gt_imgs_dir, exist_ok=True)
     os.makedirs(torso_imgs_dir, exist_ok=True)
 
+    try:
+        if opt.task in [-1, 1, 3]:
+            opt.ffmpeg = resolve_ffmpeg(opt.ffmpeg)
 
-    # extract audio
-    if opt.task == -1 or opt.task == 1:
-        extract_audio(opt.path, wav_path)
+        # extract audio
+        if opt.task == -1 or opt.task == 1:
+            extract_audio(opt.path, wav_path, ffmpeg=opt.ffmpeg)
 
-    # extract audio features
-    if opt.task == -1 or opt.task == 2:
-        extract_audio_features(wav_path, mode=opt.asr)
+        # extract audio features
+        if opt.task == -1 or opt.task == 2:
+            extract_audio_features(wav_path, mode=opt.asr)
 
-    # extract images
-    if opt.task == -1 or opt.task == 3:
-        extract_images(opt.path, ori_imgs_dir)
+        # extract images
+        if opt.task == -1 or opt.task == 3:
+            extract_images(opt.path, ori_imgs_dir, ffmpeg=opt.ffmpeg)
 
-    # face parsing
-    if opt.task == -1 or opt.task == 4:
-        extract_semantics(ori_imgs_dir, parsing_dir)
+        # face parsing
+        if opt.task == -1 or opt.task == 4:
+            extract_semantics(ori_imgs_dir, parsing_dir)
 
-    # extract bg
-    if opt.task == -1 or opt.task == 5:
-        extract_background(base_dir, ori_imgs_dir)
+        # extract bg
+        if opt.task == -1 or opt.task == 5:
+            extract_background(base_dir, ori_imgs_dir)
 
-    # extract torso images and gt_images
-    if opt.task == -1 or opt.task == 6:
-        extract_torso_and_gt(base_dir, ori_imgs_dir)
+        # extract torso images and gt_images
+        if opt.task == -1 or opt.task == 6:
+            extract_torso_and_gt(base_dir, ori_imgs_dir)
 
-    # extract face landmarks
-    if opt.task == -1 or opt.task == 7:
-        extract_landmarks(ori_imgs_dir)
+        # extract face landmarks
+        if opt.task == -1 or opt.task == 7:
+            extract_landmarks(ori_imgs_dir)
 
-    # face tracking
-    if opt.task == -1 or opt.task == 8:
-        face_tracking(ori_imgs_dir)
+        # face tracking
+        if opt.task == -1 or opt.task == 8:
+            face_tracking(ori_imgs_dir)
 
-    # save transforms.json
-    if opt.task == -1 or opt.task == 9:
-        save_transforms(base_dir, ori_imgs_dir)
-
+        # save transforms.json
+        if opt.task == -1 or opt.task == 9:
+            save_transforms(base_dir, ori_imgs_dir)
+    except (RuntimeError, subprocess.CalledProcessError) as e:
+        parser.exit(1, f'[ERROR] {e}\n')

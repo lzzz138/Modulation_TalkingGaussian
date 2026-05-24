@@ -12,8 +12,8 @@ dependencies:
   - torchaudio=0.12.1
   - torchvision=0.13.1
   - tqdm
-  - ffmpeg
-  - openh264
+  - conda-forge::ffmpeg
+  - conda-forge::openh264
   - pip:
     - ./submodules/diff-gaussian-rasterization
     - ./submodules/simple-knn
