@@ -259,4 +259,4 @@ L_upper_mouth = ||W_upper * M_mouth||_1
 不预测 Delta SH / Delta opacity
 ```
 
-这一路线最贴合当前代码结构，也最容易验证 Stage 2.1 几何调制是否真正提升 TalkingGaussian 的动态稳定性。
+这一路线最贴合当前代码结构，也最容易验证几何调制是否真正提升 TalkingGaussian 的动态稳定性。

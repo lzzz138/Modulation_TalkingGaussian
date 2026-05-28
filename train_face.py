@@ -63,8 +63,11 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     if checkpoint:
         (model_params, motion_params, motion_optimizer_params, first_iter) = torch.load(checkpoint)
         gaussians.restore(model_params, opt)
-        motion_net.load_state_dict(motion_params)
-        motion_optimizer.load_state_dict(motion_optimizer_params)
+        motion_net.load_state_dict(motion_params, strict=False)
+        try:
+            motion_optimizer.load_state_dict(motion_optimizer_params)
+        except ValueError as err:
+            print("Skipping motion optimizer state restore: {}".format(err))
 
     bg_color = [0, 1, 0]   # [1, 1, 1] # if dataset.white_background else [0, 0, 0]
     background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
@@ -150,6 +153,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         if iteration < warm_step:
             render_pkg = render(viewpoint_cam, gaussians, pipe, background)
         else:
+            mod_step = max(0, iteration - warm_step)
+            mod_strength = min(1.0, mod_step / max(1, opt.geometry_mod_warmup_steps))
+            motion_net.set_geometry_modulation_strength(mod_strength)
             render_pkg = render_motion(viewpoint_cam, gaussians, motion_net, pipe, background, return_attn=True)
 
         image_white, alpha, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["alpha"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
@@ -190,6 +196,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 loss += 1e-5 * (render_pkg['motion']['d_rot'].abs()).mean()
                 loss += 1e-5 * (render_pkg['motion']['d_opa'].abs()).mean()
                 loss += 1e-5 * (render_pkg['motion']['d_scale'].abs()).mean()
+                loss += opt.geometry_mod_tv_weight * render_pkg['motion']['modulation_tv']
+                loss += opt.geometry_mod_gate_weight * render_pkg['motion']['modulation_gate_overlap']
                 
                 loss += 1e-3 * (((1-alpha) * head_mask).mean() + (alpha * ~head_mask).mean())
 

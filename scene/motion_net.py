@@ -101,6 +101,99 @@ class MLP(nn.Module):
         return x
 
 
+class NoCublasProjector(nn.Module):
+    def __init__(self, dim_in, dim_hidden, dim_out):
+        super().__init__()
+        self.net = nn.ModuleList([
+            nn.Linear(dim_in, dim_hidden),
+            nn.Linear(dim_hidden, dim_out),
+        ])
+
+    def forward(self, x):
+        x = linear_no_cublas(x, self.net[0])
+        x = F.relu(x, inplace=True)
+        x = linear_no_cublas(x, self.net[1])
+        return x
+
+
+class AudioUpperFaceGeometryModulator(nn.Module):
+    def __init__(self,
+                 audio_dim,
+                 upper_dim,
+                 plane_dim,
+                 map_res=16,
+                 query_dim=32,
+                 hidden_dim=64,
+                 num_planes=3):
+        super().__init__()
+
+        self.num_planes = num_planes
+        self.plane_dim = plane_dim
+        self.map_res = map_res
+        self.query_dim = query_dim
+
+        self.plane_query = nn.Parameter(torch.randn(1, num_planes, query_dim, map_res, map_res) * 0.02)
+
+        self.audio_proj = NoCublasProjector(audio_dim, hidden_dim, num_planes * query_dim)
+        self.upper_proj = NoCublasProjector(upper_dim, hidden_dim, num_planes * query_dim)
+
+        self.audio_conv = nn.Sequential(
+            nn.Conv2d(query_dim, query_dim, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(query_dim, query_dim, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+        )
+        self.upper_conv = nn.Sequential(
+            nn.Conv2d(query_dim, query_dim, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(query_dim, query_dim, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+        )
+        self.gate_conv = nn.Sequential(
+            nn.Conv2d(query_dim * 3, query_dim, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(query_dim, 2, kernel_size=1),
+        )
+        self.out_conv = nn.Conv2d(query_dim, 2 * plane_dim, kernel_size=1)
+
+        nn.init.zeros_(self.out_conv.weight)
+        nn.init.zeros_(self.out_conv.bias)
+
+    def forward(self, audio_feat, upper_feat):
+        if audio_feat.dim() == 1:
+            audio_feat = audio_feat.unsqueeze(0)
+        if upper_feat.dim() == 1:
+            upper_feat = upper_feat.unsqueeze(0)
+
+        batch_size = audio_feat.shape[0]
+        query = self.plane_query.expand(batch_size, -1, -1, -1, -1)
+
+        audio_bias = self.audio_proj(audio_feat).view(batch_size, self.num_planes, self.query_dim, 1, 1)
+        upper_bias = self.upper_proj(upper_feat).view(batch_size, self.num_planes, self.query_dim, 1, 1)
+
+        query_flat = query.reshape(batch_size * self.num_planes, self.query_dim, self.map_res, self.map_res)
+        audio_query = (query + audio_bias).reshape(batch_size * self.num_planes, self.query_dim, self.map_res, self.map_res)
+        upper_query = (query + upper_bias).reshape(batch_size * self.num_planes, self.query_dim, self.map_res, self.map_res)
+
+        audio_candidate = self.audio_conv(audio_query)
+        upper_candidate = self.upper_conv(upper_query)
+        gate_logits = self.gate_conv(torch.cat([query_flat, audio_candidate, upper_candidate], dim=1))
+        gate = torch.softmax(gate_logits, dim=1)
+
+        fused = gate[:, 0:1] * audio_candidate + gate[:, 1:2] * upper_candidate
+        gamma_beta = self.out_conv(fused)
+        gamma_beta = gamma_beta.view(
+            batch_size,
+            self.num_planes,
+            2,
+            self.plane_dim,
+            self.map_res,
+            self.map_res,
+        )
+        gate = gate.view(batch_size, self.num_planes, 2, self.map_res, self.map_res)
+        return gamma_beta, gate
+
+
 class MotionNetwork(nn.Module):
     def __init__(self,
                  audio_dim = 32,
@@ -150,6 +243,14 @@ class MotionNetwork(nn.Module):
         self.exp_encode_net = MLP(self.exp_in_dim, self.eye_dim - 1, 16, 2)
 
         self.eye_att_net = MLP(self.in_dim, self.eye_dim, 16, 2)
+        self.geometry_modulator = AudioUpperFaceGeometryModulator(
+            audio_dim=self.audio_dim,
+            upper_dim=self.eye_dim,
+            plane_dim=self.in_dim_xy,
+            map_res=getattr(args, 'geometry_mod_map_res', 16),
+        )
+        self.geometry_modulation_strength = 1.0
+        self.condition_residual_scale = getattr(args, 'geometry_mod_condition_scale', 0.1)
 
         # rot: 4   xyz: 3   opac: 1  scale: 3
         self.out_dim = 11
@@ -165,15 +266,19 @@ class MotionNetwork(nn.Module):
         return xy, yz, xz
 
 
-    def encode_x(self, xyz, bound):
+    def encode_planes(self, xyz, bound):
         # x: [N, 3], in [-bound, bound]
-        N, M = xyz.shape
         xy, yz, xz = self.split_xyz(xyz)
         feat_xy = self.encoder_xy(xy, bound=bound)
         feat_yz = self.encoder_yz(yz, bound=bound)
         feat_xz = self.encoder_xz(xz, bound=bound)
-        
-        return torch.cat([feat_xy, feat_yz, feat_xz], dim=-1)
+
+        return (xy, yz, xz), (feat_xy, feat_yz, feat_xz)
+
+
+    def encode_x(self, xyz, bound):
+        _, plane_feats = self.encode_planes(xyz, bound)
+        return torch.cat(plane_feats, dim=-1)
     
 
     def encode_audio(self, a):
@@ -189,24 +294,72 @@ class MotionNetwork(nn.Module):
         return enc_a
 
 
-    def forward(self, x, a, e=None, c=None):
-        # x: [N, 3], in [-bound, bound]
-        enc_x = self.encode_x(x, bound=self.bound)
-
-        enc_a = self.encode_audio(a)
-        enc_a = enc_a.repeat(enc_x.shape[0], 1)
-        aud_ch_att = self.aud_ch_att_net(enc_x)
-        enc_w = enc_a * aud_ch_att
-        
-        eye_att = torch.relu(self.eye_att_net(enc_x))
+    def encode_upper_face(self, e):
         enc_e = self.exp_encode_net(e[:-1])
         enc_e = torch.cat([enc_e, e[-1:]], dim=-1)
-        enc_e = enc_e * eye_att
+        return enc_e.unsqueeze(0)
+
+
+    @staticmethod
+    def modulation_tv_loss(gamma_beta):
+        loss = (gamma_beta[..., 1:, :] - gamma_beta[..., :-1, :]).abs().mean()
+        loss = loss + (gamma_beta[..., :, 1:] - gamma_beta[..., :, :-1]).abs().mean()
+        return loss
+
+
+    @staticmethod
+    def gate_overlap_loss(gate):
+        return (gate[:, :, 0] * gate[:, :, 1]).mean()
+
+
+    @staticmethod
+    def sample_modulation(modulation_map, coords, bound):
+        # modulation_map: [1, 2, C, H, W], coords: [N, 2] in [-bound, bound]
+        channels = modulation_map.shape[2]
+        sample_map = modulation_map.reshape(1, 2 * channels, modulation_map.shape[-2], modulation_map.shape[-1])
+        grid = (coords / bound).clamp(-1, 1).view(1, -1, 1, 2)
+        samples = F.grid_sample(sample_map, grid, mode='bilinear', padding_mode='border', align_corners=True)
+        samples = samples.squeeze(0).squeeze(-1).transpose(0, 1)
+        gamma, beta = samples.split(channels, dim=-1)
+        return gamma, beta
+
+
+    def apply_geometry_modulation(self, plane_coords, plane_feats, gamma_beta):
+        strength = self.geometry_modulation_strength
+        modulated_feats = []
+        for plane_idx, (coords, feat) in enumerate(zip(plane_coords, plane_feats)):
+            gamma, beta = self.sample_modulation(gamma_beta[:, plane_idx], coords, self.bound)
+            feat_dyn = (1 + strength * torch.tanh(gamma)) * feat + strength * beta
+            modulated_feats.append(feat_dyn)
+        return modulated_feats
+
+
+    def set_geometry_modulation_strength(self, strength):
+        self.geometry_modulation_strength = max(0.0, min(1.0, float(strength)))
+
+
+    def forward(self, x, a, e=None, c=None):
+        # x: [N, 3], in [-bound, bound]
+        plane_coords, plane_feats = self.encode_planes(x, bound=self.bound)
+
+        enc_a = self.encode_audio(a)
+        enc_e_global = self.encode_upper_face(e)
+
+        gamma_beta, gate = self.geometry_modulator(enc_a, enc_e_global)
+        plane_feats_dyn = self.apply_geometry_modulation(plane_coords, plane_feats, gamma_beta)
+        enc_x_dyn = torch.cat(plane_feats_dyn, dim=-1)
+
+        enc_a = enc_a.repeat(enc_x_dyn.shape[0], 1)
+        aud_ch_att = self.aud_ch_att_net(enc_x_dyn)
+        enc_w = enc_a * aud_ch_att
+        
+        eye_att = torch.relu(self.eye_att_net(enc_x_dyn))
+        enc_e = enc_e_global * eye_att
         if c is not None:
-            c = c.repeat(enc_x.shape[0], 1)
-            h = torch.cat([enc_x, enc_w, enc_e, c], dim=-1)
+            c = c.repeat(enc_x_dyn.shape[0], 1)
+            h = torch.cat([enc_x_dyn, self.condition_residual_scale * enc_w, self.condition_residual_scale * enc_e, c], dim=-1)
         else:
-            h = torch.cat([enc_x, enc_w, enc_e], dim=-1)
+            h = torch.cat([enc_x_dyn, self.condition_residual_scale * enc_w, self.condition_residual_scale * enc_e], dim=-1)
 
         h = self.sigma_net(h)
 
@@ -221,6 +374,8 @@ class MotionNetwork(nn.Module):
             'd_scale': d_scale,
             'ambient_aud' : aud_ch_att.norm(dim=-1, keepdim=True),
             'ambient_eye' : eye_att.norm(dim=-1, keepdim=True),
+            'modulation_tv': self.modulation_tv_loss(gamma_beta),
+            'modulation_gate_overlap': self.gate_overlap_loss(gate),
         }
 
 
@@ -232,6 +387,7 @@ class MotionNetwork(nn.Module):
             {'params': self.encoder_xy.parameters(), 'lr': lr},
             {'params': self.encoder_yz.parameters(), 'lr': lr},
             {'params': self.encoder_xz.parameters(), 'lr': lr},
+            {'params': self.geometry_modulator.parameters(), 'lr': lr_net, 'weight_decay': wd},
             {'params': self.sigma_net.parameters(), 'lr': lr_net, 'weight_decay': wd},
         ]
         params.append({'params': self.audio_att_net.parameters(), 'lr': lr_net * 5, 'weight_decay': 0.0001})

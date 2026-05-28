@@ -57,6 +57,8 @@ class ModelParams(ParamGroup):
         self.audio = ""
         self.init_num = 10_000
         self.audio_extractor = "deepspeech"
+        self.geometry_mod_map_res = 16
+        self.geometry_mod_condition_scale = 0.1
         super().__init__(parser, "Loading Parameters", sentinel)
 
     def extract(self, args):
@@ -93,6 +95,9 @@ class OptimizationParams(ParamGroup):
         self.densify_until_iter = 45_000
         self.densify_grad_threshold = 0.0002
         self.random_background = False
+        self.geometry_mod_warmup_steps = 3000
+        self.geometry_mod_tv_weight = 1e-5
+        self.geometry_mod_gate_weight = 1e-5
         super().__init__(parser, "Optimization Parameters")
 
 def get_combined_args(parser : ArgumentParser):
