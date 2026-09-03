@@ -2,7 +2,10 @@ import torch
 import torch.nn as nn
 import numpy as np
 import os
-from util import *
+try:
+    from .util import *
+except ImportError:
+    from util import *
 
 
 class Face_3DMM(nn.Module):
@@ -46,7 +49,10 @@ class Face_3DMM(nn.Module):
         self.right_contours = torch.as_tensor(keys_info["right_contour"]).cuda()
         self.rigid_ids = torch.as_tensor(keys_info["rigid_ids"]).cuda()
 
-    def get_3dlandmarks(self, id_para, exp_para, euler_angle, trans, focal_length, cxy):
+    def get_3dlandmarks(
+        self, id_para, exp_para, euler_angle, trans, focal_length, cxy,
+        return_indices=False,
+    ):
         id_para = id_para * self.sig_id
         exp_para = exp_para * self.sig_exp
         batch_size = id_para.shape[0]
@@ -76,6 +82,10 @@ class Face_3DMM(nn.Module):
         left_3dlands = left_geometry[
             torch.arange(batch_size * 8), arg_min.view(-1), :
         ].view(batch_size, 8, 3)
+        left_indices = left_contours_flat.view(8, num_per_contour)[
+            torch.arange(8, device=arg_min.device)[None].expand(batch_size, -1),
+            arg_min,
+        ]
 
         sel_index = torch.cat(
             (
@@ -100,6 +110,10 @@ class Face_3DMM(nn.Module):
         right_3dlands = right_geometry[
             torch.arange(batch_size * 8), arg_max.view(-1), :
         ].view(batch_size, 8, 3)
+        right_indices = right_contours_flat.view(8, num_per_contour)[
+            torch.arange(8, device=arg_max.device)[None].expand(batch_size, -1),
+            arg_max,
+        ]
 
         sel_index = torch.cat(
             (
@@ -117,7 +131,13 @@ class Face_3DMM(nn.Module):
         lands_3d = geometry.view(-1, self.keyinds.shape[0], 3)
         lands_3d[:, :8, :] = left_3dlands
         lands_3d[:, 9:17, :] = right_3dlands
-        return lands_3d
+        if not return_indices:
+            return lands_3d
+
+        land_indices = self.keyinds[None].expand(batch_size, -1).clone()
+        land_indices[:, :8] = left_indices
+        land_indices[:, 9:17] = right_indices
+        return lands_3d, land_indices
 
     def forward_geo_sub(self, id_para, exp_para, sub_index):
         id_para = id_para * self.sig_id

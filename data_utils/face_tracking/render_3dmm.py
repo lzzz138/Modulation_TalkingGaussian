@@ -200,3 +200,35 @@ class Render_3DMM(nn.Module):
         rendered_img = torch.clamp(rendered_img, 0, 255)
 
         return rendered_img
+
+    @torch.no_grad()
+    def vertex_visibility(self, rott_geometry):
+        """Return z-buffer visibility and front-facing scores per vertex."""
+        dummy_color = TexturesVertex(torch.ones_like(rott_geometry))
+        mesh = Meshes(
+            rott_geometry,
+            self.tris[None].expand(rott_geometry.shape[0], -1, -1),
+            dummy_color,
+        )
+        fragments = self.renderer.rasterizer(mesh)
+        face_ids = fragments.pix_to_face[..., 0]
+        face_visible = torch.zeros(
+            rott_geometry.shape[0], self.tris.shape[0],
+            dtype=torch.bool, device=rott_geometry.device,
+        )
+        for batch_id in range(rott_geometry.shape[0]):
+            visible_ids = torch.unique(face_ids[batch_id])
+            visible_ids = visible_ids[visible_ids >= 0]
+            # PyTorch3D returns packed face ids across the whole mesh batch.
+            visible_ids = visible_ids - batch_id * self.tris.shape[0]
+            visible_ids = visible_ids[
+                (visible_ids >= 0) & (visible_ids < self.tris.shape[0])
+            ]
+            face_visible[batch_id, visible_ids] = True
+
+        adjacent = self.vert_tris.clamp(0, self.tris.shape[0] - 1)
+        z_visible = face_visible[:, adjacent].any(dim=-1)
+        normals = self.compute_normal(rott_geometry)
+        view = nn.functional.normalize(rott_geometry, dim=-1)
+        front_score = torch.clamp(-(normals * view).sum(dim=-1), min=0.0)
+        return z_visible, front_score

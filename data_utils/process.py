@@ -153,15 +153,39 @@ def extract_landmarks(ori_imgs_dir):
                 flip_input=False,
                 device=device,
             )
-        image_paths = sorted(glob.glob(os.path.join(ori_imgs_dir, '*.jpg')))
+        image_paths = sorted(
+            glob.glob(os.path.join(ori_imgs_dir, '*.jpg')),
+            key=lambda path: int(os.path.splitext(os.path.basename(path))[0]),
+        )
         require_files(image_paths, f'face landmarks in {ori_imgs_dir}')
-        for image_path in tqdm.tqdm(image_paths):
+        landmarks = np.full((len(image_paths), 68, 2), np.nan, dtype=np.float32)
+        scores = np.zeros((len(image_paths), 68), dtype=np.float32)
+        for frame_id, image_path in enumerate(tqdm.tqdm(image_paths)):
             input = cv2.imread(image_path, cv2.IMREAD_UNCHANGED) # [H, W, 3]
             input = cv2.cvtColor(input, cv2.COLOR_BGR2RGB)
-            preds = fa.get_landmarks(input)
+            preds, pred_scores, _ = fa.get_landmarks(
+                input, return_landmark_score=True
+            )
             if preds is not None and len(preds) > 0:
-                lands = preds[0].reshape(-1, 2)[:,:2]
-                np.savetxt(image_path.replace('jpg', 'lms'), lands, '%f')
+                landmarks[frame_id] = preds[0].reshape(-1, 2)[:, :2]
+                scores[frame_id] = np.asarray(pred_scores[0]).reshape(-1)[:68]
+
+        valid = np.isfinite(landmarks).all(axis=(1, 2))
+        if not valid.any():
+            raise RuntimeError(f'No valid face landmarks found in {ori_imgs_dir}')
+        frame_ids = np.arange(len(image_paths))
+        valid_ids = frame_ids[valid]
+        for point_id in range(68):
+            for axis in range(2):
+                landmarks[:, point_id, axis] = np.interp(
+                    frame_ids, valid_ids, landmarks[valid, point_id, axis]
+                )
+        for frame_id, image_path in enumerate(image_paths):
+            np.savetxt(
+                os.path.splitext(image_path)[0] + '.lms',
+                landmarks[frame_id], '%f'
+            )
+        np.save(os.path.join(os.path.dirname(ori_imgs_dir), 'landmark_scores.npy'), scores)
         del fa
     finally:
         torch.load = torch_load
@@ -371,7 +395,24 @@ def face_tracking(ori_imgs_dir):
     print(f'[INFO] ===== finished face tracking =====')
 
 
-def save_transforms(base_dir, ori_imgs_dir):
+def stabilize_head(
+    base_dir, preset='balanced', flow_backend='raft', overwrite=False
+):
+    print(f'[INFO] ===== run LPHS head stabilization =====')
+    cmd = [
+        sys.executable,
+        'data_utils/stabilize_head.py',
+        '--data', base_dir,
+        '--preset', preset,
+        '--flow_backend', flow_backend,
+    ]
+    if overwrite:
+        cmd.append('--overwrite')
+    run_command(cmd)
+    print(f'[INFO] ===== finished LPHS head stabilization =====')
+
+
+def save_transforms(base_dir, ori_imgs_dir, track_params='track_params.pt'):
     print(f'[INFO] ===== save transforms =====')
 
     import torch
@@ -383,7 +424,10 @@ def save_transforms(base_dir, ori_imgs_dir):
     tmp_image = cv2.imread(image_paths[0], cv2.IMREAD_UNCHANGED) # [H, W, 3]
     h, w = tmp_image.shape[:2]
 
-    params_dict = torch.load(os.path.join(base_dir, 'track_params.pt'))
+    params_path = track_params
+    if not os.path.isabs(params_path):
+        params_path = os.path.join(base_dir, params_path)
+    params_dict = torch.load(params_path, map_location='cpu')
     focal_len = params_dict['focal']
     euler_angle = params_dict['euler']
     trans = params_dict['trans'] / 10.0
@@ -421,7 +465,16 @@ def save_transforms(base_dir, ori_imgs_dir):
     train_ids = torch.arange(0, train_val_split)
     val_ids = torch.arange(train_val_split, valid_num)
 
-    rot = euler2rot(euler_angle)
+    rot = params_dict.get('rot')
+    if rot is None:
+        rot = euler2rot(euler_angle)
+    else:
+        rot = rot.float()
+        if rot.shape != (valid_num, 3, 3):
+            raise RuntimeError(
+                f'Invalid rot shape in {params_path}: expected '
+                f'{(valid_num, 3, 3)}, got {tuple(rot.shape)}'
+            )
     rot_inv = rot.permute(0, 2, 1)
     trans_inv = -torch.bmm(rot_inv, trans.unsqueeze(2))
 
@@ -463,6 +516,26 @@ if __name__ == '__main__':
     parser.add_argument('path', type=str, help="path to video file")
     parser.add_argument('--task', type=int, default=-1, help="-1 means all")
     parser.add_argument('--asr', type=str, default='deepspeech', help="wav2vec or deepspeech")
+    parser.add_argument(
+        '--head_stabilizer', choices=['none', 'lphs'], default='none',
+        help='optional offline head-pose stabilizer',
+    )
+    parser.add_argument(
+        '--lphs_preset', choices=['fast', 'balanced', 'quality'],
+        default='balanced', help='LPHS quality/speed preset',
+    )
+    parser.add_argument(
+        '--lphs_flow_backend', choices=['raft', 'dis'], default='raft',
+        help='LPHS optical-flow backend; RAFT falls back to DIS when unavailable',
+    )
+    parser.add_argument(
+        '--lphs_overwrite', action='store_true',
+        help='replace an existing track_params_lphs.pt',
+    )
+    parser.add_argument(
+        '--track_params', type=str, default=None,
+        help='parameter file used by task 9; defaults to track_params.pt',
+    )
     parser.add_argument(
         '--ffmpeg',
         type=str,
@@ -521,8 +594,24 @@ if __name__ == '__main__':
         if opt.task == -1 or opt.task == 8:
             face_tracking(ori_imgs_dir)
 
+        # run LPHS explicitly with task 10, or as part of the full pipeline
+        if opt.task == 10 or (opt.task == -1 and opt.head_stabilizer == 'lphs'):
+            stabilize_head(
+                base_dir,
+                preset=opt.lphs_preset,
+                flow_backend=opt.lphs_flow_backend,
+                overwrite=opt.lphs_overwrite,
+            )
+
         # save transforms.json
         if opt.task == -1 or opt.task == 9:
-            save_transforms(base_dir, ori_imgs_dir)
+            track_params = opt.track_params
+            if track_params is None:
+                track_params = (
+                    'track_params_lphs.pt'
+                    if opt.head_stabilizer == 'lphs'
+                    else 'track_params.pt'
+                )
+            save_transforms(base_dir, ori_imgs_dir, track_params=track_params)
     except (RuntimeError, subprocess.CalledProcessError) as e:
         parser.exit(1, f'[ERROR] {e}\n')

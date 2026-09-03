@@ -113,7 +113,8 @@ h_i,dyn^p = (1 + lambda_gamma * tanh(Delta gamma_i^p)) * h_i^p
 调制后再预测几何偏移：
 
 ```python
-h = torch.cat([enc_x_dyn, enc_w, enc_e], dim=-1)
+h = enc_x_dyn
+h = torch.cat([h, individual_code], dim=-1)  # individual code 启用时
 h = self.sigma_net(h)
 
 d_xyz = h[..., :3] * 1e-2
@@ -121,19 +122,17 @@ d_rot = h[..., 3:7]
 d_scale = h[..., 8:11]
 ```
 
-第一版建议保留弱条件残差路径，避免一次性去掉原始条件注入导致训练不稳定：
-
-```python
-h = torch.cat([enc_x_dyn, 0.1 * enc_w, 0.1 * enc_e], dim=-1)
-```
-
-完成 ablation 后，再比较：
+当前实现删除原始条件旁路。音频特征和上脸表情特征只用于生成三平面调制参数，不再直接拼接到形变 MLP：
 
 ```text
-A. enc_x + enc_w + enc_e                       # 原始
-B. enc_x_dyn + enc_w + enc_e                   # 保守版
-C. enc_x_dyn + 0.1*enc_w + 0.1*enc_e           # 推荐第一版
-D. enc_x_dyn                                   # 完全调制版
+audio, upper-face AU -> spatial gamma/beta -> enc_x_dyn -> sigma_net
+```
+
+这样可将形变增益明确归因于空间调制路径。对应消融为：
+
+```text
+A. enc_x + enc_w + enc_e                       # 原始条件旁路
+B. enc_x_dyn                                   # 当前直接调制
 ```
 
 ## Initialization
