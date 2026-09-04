@@ -116,6 +116,32 @@ class NoCublasProjector(nn.Module):
         return x
 
 
+class GaussianScaleRouter(nn.Module):
+    def __init__(self, feature_dim, hidden_dim=32):
+        super().__init__()
+        self.fc1 = nn.Linear(feature_dim + 4, hidden_dim, bias=True)
+        self.fc2 = nn.Linear(hidden_dim, 3, bias=True)
+        nn.init.zeros_(self.fc2.weight)
+        with torch.no_grad():
+            self.fc2.bias.copy_(torch.tensor([-1.0, 2.0, -1.0]))
+
+    @staticmethod
+    def scale_descriptor(gaussian_scaling):
+        log_scale = gaussian_scaling.detach().clamp_min(1e-8).log()
+        mean_scale = log_scale.mean(dim=-1, keepdim=True)
+        return torch.cat([mean_scale, log_scale - mean_scale], dim=-1)
+
+    def forward(self, spatial_feature, gaussian_scaling):
+        descriptor = self.scale_descriptor(gaussian_scaling)
+        hidden = F.relu(
+            linear_no_cublas(
+                torch.cat([spatial_feature, descriptor], dim=-1), self.fc1
+            ),
+            inplace=True,
+        )
+        return torch.softmax(linear_no_cublas(hidden, self.fc2), dim=-1)
+
+
 class AudioUpperFaceGeometryModulator(nn.Module):
     def __init__(self,
                  audio_dim,
@@ -124,13 +150,18 @@ class AudioUpperFaceGeometryModulator(nn.Module):
                  map_res=16,
                  query_dim=32,
                  hidden_dim=64,
-                 num_planes=3):
+                 num_planes=3,
+                 multiscale=False):
         super().__init__()
 
         self.num_planes = num_planes
         self.plane_dim = plane_dim
         self.map_res = map_res
         self.query_dim = query_dim
+        self.multiscale = multiscale
+
+        if self.multiscale and map_res != 16:
+            raise ValueError('Multi-scale modulation requires geometry_mod_map_res=16.')
 
         self.plane_query = nn.Parameter(torch.randn(1, num_planes, query_dim, map_res, map_res) * 0.02)
 
@@ -156,8 +187,33 @@ class AudioUpperFaceGeometryModulator(nn.Module):
         )
         self.out_conv = nn.Conv2d(query_dim, 2 * plane_dim, kernel_size=1)
 
+        if self.multiscale:
+            self.down_conv = nn.Conv2d(
+                query_dim, query_dim, kernel_size=3, stride=2, padding=1
+            )
+            self.up_conv = nn.Conv2d(
+                query_dim, query_dim, kernel_size=3, stride=1, padding=1
+            )
+            self.out_conv_8 = nn.Conv2d(query_dim, 2 * plane_dim, kernel_size=1)
+            self.out_conv_32 = nn.Conv2d(query_dim, 2 * plane_dim, kernel_size=1)
+
         nn.init.zeros_(self.out_conv.weight)
         nn.init.zeros_(self.out_conv.bias)
+        if self.multiscale:
+            nn.init.zeros_(self.out_conv_8.weight)
+            nn.init.zeros_(self.out_conv_8.bias)
+            nn.init.zeros_(self.out_conv_32.weight)
+            nn.init.zeros_(self.out_conv_32.bias)
+
+    def reshape_modulation(self, modulation):
+        return modulation.view(
+            modulation.shape[0] // self.num_planes,
+            self.num_planes,
+            2,
+            self.plane_dim,
+            modulation.shape[-2],
+            modulation.shape[-1],
+        )
 
     def forward(self, audio_feat, upper_feat):
         if audio_feat.dim() == 1:
@@ -181,17 +237,21 @@ class AudioUpperFaceGeometryModulator(nn.Module):
         gate = torch.softmax(gate_logits, dim=1)
 
         fused = gate[:, 0:1] * audio_candidate + gate[:, 1:2] * upper_candidate
-        gamma_beta = self.out_conv(fused)
-        gamma_beta = gamma_beta.view(
-            batch_size,
-            self.num_planes,
-            2,
-            self.plane_dim,
-            self.map_res,
-            self.map_res,
-        )
         gate = gate.view(batch_size, self.num_planes, 2, self.map_res, self.map_res)
-        return gamma_beta, gate
+        modulation_16 = self.reshape_modulation(self.out_conv(fused))
+        if not self.multiscale:
+            return modulation_16, gate
+
+        feature_8 = self.down_conv(fused)
+        feature_32 = self.up_conv(F.interpolate(
+            fused,
+            scale_factor=2.0,
+            mode='bilinear',
+            align_corners=False,
+        ))
+        modulation_8 = self.reshape_modulation(self.out_conv_8(feature_8))
+        modulation_32 = self.reshape_modulation(self.out_conv_32(feature_32))
+        return (modulation_8, modulation_16, modulation_32), gate
 
 
 class MotionNetwork(nn.Module):
@@ -243,12 +303,19 @@ class MotionNetwork(nn.Module):
         self.exp_encode_net = MLP(self.exp_in_dim, self.eye_dim - 1, 16, 2)
 
         self.eye_att_net = MLP(self.in_dim, self.eye_dim, 16, 2)
+        multiscale_value = getattr(args, 'geometry_mod_multiscale', 1)
+        if multiscale_value not in (0, 1):
+            raise ValueError('geometry_mod_multiscale must be 0 or 1.')
+        self.geometry_mod_multiscale = bool(multiscale_value)
         self.geometry_modulator = AudioUpperFaceGeometryModulator(
             audio_dim=self.audio_dim,
             upper_dim=self.eye_dim,
             plane_dim=self.in_dim_xy,
             map_res=getattr(args, 'geometry_mod_map_res', 16),
+            multiscale=self.geometry_mod_multiscale,
         )
+        if self.geometry_mod_multiscale:
+            self.scale_router = GaussianScaleRouter(self.in_dim)
         self.geometry_modulation_strength = 1.0
         self.condition_residual_scale = getattr(args, 'geometry_mod_condition_scale', 0.1)
 
@@ -302,6 +369,10 @@ class MotionNetwork(nn.Module):
 
     @staticmethod
     def modulation_tv_loss(gamma_beta):
+        if isinstance(gamma_beta, (tuple, list)):
+            return sum(
+                MotionNetwork.modulation_tv_loss(value) for value in gamma_beta
+            ) / len(gamma_beta)
         loss = (gamma_beta[..., 1:, :] - gamma_beta[..., :-1, :]).abs().mean()
         loss = loss + (gamma_beta[..., :, 1:] - gamma_beta[..., :, :-1]).abs().mean()
         return loss
@@ -324,11 +395,28 @@ class MotionNetwork(nn.Module):
         return gamma, beta
 
 
-    def apply_geometry_modulation(self, plane_coords, plane_feats, gamma_beta):
+    def apply_geometry_modulation(self, plane_coords, plane_feats, gamma_beta,
+                                  routing_weights=None):
         strength = self.geometry_modulation_strength
         modulated_feats = []
         for plane_idx, (coords, feat) in enumerate(zip(plane_coords, plane_feats)):
-            gamma, beta = self.sample_modulation(gamma_beta[:, plane_idx], coords, self.bound)
+            if routing_weights is None:
+                gamma, beta = self.sample_modulation(
+                    gamma_beta[:, plane_idx], coords, self.bound
+                )
+            else:
+                sampled = [
+                    self.sample_modulation(value[:, plane_idx], coords, self.bound)
+                    for value in gamma_beta
+                ]
+                gamma = sum(
+                    routing_weights[:, scale_idx:scale_idx + 1] * value[0]
+                    for scale_idx, value in enumerate(sampled)
+                )
+                beta = sum(
+                    routing_weights[:, scale_idx:scale_idx + 1] * value[1]
+                    for scale_idx, value in enumerate(sampled)
+                )
             feat_dyn = (1 + strength * torch.tanh(gamma)) * feat + strength * beta
             modulated_feats.append(feat_dyn)
         return modulated_feats
@@ -338,7 +426,23 @@ class MotionNetwork(nn.Module):
         self.geometry_modulation_strength = max(0.0, min(1.0, float(strength)))
 
 
-    def forward(self, x, a, e=None, c=None):
+    def validate_multiscale_checkpoint(self, state_dict):
+        checkpoint_multiscale = any(
+            key.startswith('scale_router.')
+            or key.startswith('geometry_modulator.out_conv_8.')
+            for key in state_dict
+        )
+        if checkpoint_multiscale != self.geometry_mod_multiscale:
+            raise RuntimeError(
+                'Face checkpoint multi-scale mode is {}, but the current model '
+                'multi-scale mode is {}.'.format(
+                    int(checkpoint_multiscale),
+                    int(self.geometry_mod_multiscale),
+                )
+            )
+
+
+    def forward(self, x, a, e=None, c=None, gaussian_scaling=None):
         # x: [N, 3], in [-bound, bound]
         plane_coords, plane_feats = self.encode_planes(x, bound=self.bound)
 
@@ -346,7 +450,20 @@ class MotionNetwork(nn.Module):
         enc_e_global = self.encode_upper_face(e)
 
         gamma_beta, gate = self.geometry_modulator(enc_a, enc_e_global)
-        plane_feats_dyn = self.apply_geometry_modulation(plane_coords, plane_feats, gamma_beta)
+        routing_weights = None
+        if self.geometry_mod_multiscale:
+            if gaussian_scaling is None:
+                raise ValueError(
+                    'gaussian_scaling is required for multi-scale modulation.'
+                )
+            if gaussian_scaling.shape != x.shape:
+                raise ValueError('gaussian_scaling must have shape [N, 3].')
+            routing_weights = self.scale_router(
+                torch.cat(plane_feats, dim=-1), gaussian_scaling
+            )
+        plane_feats_dyn = self.apply_geometry_modulation(
+            plane_coords, plane_feats, gamma_beta, routing_weights
+        )
         enc_x_dyn = torch.cat(plane_feats_dyn, dim=-1)
 
         enc_a = enc_a.repeat(enc_x_dyn.shape[0], 1)
@@ -376,6 +493,11 @@ class MotionNetwork(nn.Module):
             'ambient_eye' : eye_att.norm(dim=-1, keepdim=True),
             'modulation_tv': self.modulation_tv_loss(gamma_beta),
             'modulation_gate_overlap': self.gate_overlap_loss(gate),
+            'scale_routing_mean': (
+                routing_weights.mean(dim=0)
+                if routing_weights is not None
+                else x.new_tensor([0.0, 1.0, 0.0])
+            ),
         }
 
 
@@ -390,6 +512,12 @@ class MotionNetwork(nn.Module):
             {'params': self.geometry_modulator.parameters(), 'lr': lr_net, 'weight_decay': wd},
             {'params': self.sigma_net.parameters(), 'lr': lr_net, 'weight_decay': wd},
         ]
+        if self.geometry_mod_multiscale:
+            params.append({
+                'params': self.scale_router.parameters(),
+                'lr': lr_net,
+                'weight_decay': wd,
+            })
         params.append({'params': self.audio_att_net.parameters(), 'lr': lr_net * 5, 'weight_decay': 0.0001})
         if self.individual_dim > 0:
             params.append({'params': self.individual_codes, 'lr': lr_net, 'weight_decay': wd})

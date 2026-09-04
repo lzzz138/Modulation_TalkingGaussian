@@ -143,7 +143,13 @@ def render_motion(viewpoint_camera, pc : GaussianModel, motion_net : MotionNetwo
 
     # ind_code = motion_net.individual_codes[frame_idx if frame_idx is not None else viewpoint_camera.talking_dict["img_id"]]
     ind_code = None
-    motion_preds = motion_net(pc.get_xyz, audio_feat, exp_feat, ind_code) #  
+    motion_preds = motion_net(
+        pc.get_xyz,
+        audio_feat,
+        exp_feat,
+        ind_code,
+        gaussian_scaling=pc.get_scaling.detach(),
+    )
     means3D = pc.get_xyz + motion_preds['d_xyz']
     means2D = screenspace_points
     # opacity = pc.opacity_activation(pc._opacity + motion_preds['d_opa'])
@@ -268,4 +274,3 @@ def render_motion_mouth(viewpoint_camera, pc : GaussianModel, motion_net : Mouth
             "alpha": rendered_alpha,
             "radii": radii,
             "motion": motion_preds}
-

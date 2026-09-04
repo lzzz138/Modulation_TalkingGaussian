@@ -95,6 +95,7 @@ def render_sets(dataset : ModelParams, iteration : int, pipeline : PipelineParam
         motion_net_mouth = MouthMotionNetwork(args=dataset).cuda()
 
         (model_params, motion_params, model_mouth_params, motion_mouth_params) = torch.load(os.path.join(dataset.model_path, "chkpnt_fuse_latest.pth"))
+        motion_net.validate_multiscale_checkpoint(motion_params)
         motion_net.load_state_dict(motion_params, strict=False)
         gaussians.restore(model_params, None)
 

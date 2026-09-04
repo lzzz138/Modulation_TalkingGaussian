@@ -54,6 +54,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     scene = Scene(dataset, gaussians)
 
     motion_net = MotionNetwork(args=dataset).cuda()
+    print("Face multi-scale modulation: {}".format(
+        "adaptive-8/16/32" if motion_net.geometry_mod_multiscale else "fixed-16"
+    ))
     motion_optimizer = torch.optim.AdamW(motion_net.get_params(5e-3, 5e-4), betas=(0.9, 0.99), eps=1e-8)
     scheduler = torch.optim.lr_scheduler.LambdaLR(motion_optimizer, lambda iter: (0.5 ** (iter / mouth_select_iter)) if iter < mouth_select_iter else 0.1 ** (iter / bg_iter))
 
@@ -63,6 +66,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     if checkpoint:
         (model_params, motion_params, motion_optimizer_params, first_iter) = torch.load(checkpoint)
         gaussians.restore(model_params, opt)
+        motion_net.validate_multiscale_checkpoint(motion_params)
         motion_net.load_state_dict(motion_params, strict=False)
         try:
             motion_optimizer.load_state_dict(motion_optimizer_params)
@@ -246,6 +250,16 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             if iteration % 10 == 0:
                 progress_bar.set_postfix({"Loss": f"{ema_loss_for_log:.{5}f}", "Mouth": f"{mouth_lb:.{1}f}-{mouth_ub:.{1}f}"}) # , "AU25": f"{au_lb:.{1}f}-{au_ub:.{1}f}"
                 progress_bar.update(10)
+            if (
+                tb_writer
+                and iteration >= warm_step
+                and iteration % 100 == 0
+                and motion_net.geometry_mod_multiscale
+            ):
+                routing_mean = render_pkg['motion']['scale_routing_mean']
+                tb_writer.add_scalar('scale_router/weight_8', routing_mean[0].item(), iteration)
+                tb_writer.add_scalar('scale_router/weight_16', routing_mean[1].item(), iteration)
+                tb_writer.add_scalar('scale_router/weight_32', routing_mean[2].item(), iteration)
             if iteration == opt.iterations:
                 progress_bar.close()
 

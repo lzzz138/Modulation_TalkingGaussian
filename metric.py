@@ -770,7 +770,7 @@ class VideoMetricsCalculator:
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('gen_video', nargs='?', default='/home/lzq/paperCode/talkinghead/TalkingGaussian/output/exp1/test/ours_None/renders/out.mp4')
+    parser.add_argument('gen_video', nargs='?', default='/home/lzq/paperCode/talkinghead/TalkingGaussian/output/exp_adaptive/test/ours_None/renders/out.mp4')
     parser.add_argument('real_video', nargs='?', default='/home/lzq/paperCode/talkinghead/TalkingGaussian/output/pose/test/ours_None/gt/out.mp4')
     parser.add_argument('--device', default='cuda')
     parser.add_argument('--batch_size', type=int, default=32)
@@ -815,11 +815,11 @@ def main():
     print('\n[METRIC] CSIM')
     real_if = calculator.extract_insightface_features(frames_real, name='real')
     gen_if = calculator.extract_insightface_features(frames_gen, name='gen')
-    # csim = calculator.calculate_csim_from_features(gen_if, real_if)
-    # if csim is None:
-    #     print('CSIM: skipped (InsightFace is unavailable)')
-    # else:
-    #     print(f'CSIM: {csim:.6f}')
+    csim = calculator.calculate_csim_from_features(gen_if, real_if)
+    if csim is None:
+        print('CSIM: skipped (InsightFace is unavailable)')
+    else:
+        print(f'CSIM: {csim:.6f}')
 
     # FAN landmarks are shared by LVD and optional face-region flow masking.
     print('\n[INFO] extracting FAN landmarks...')

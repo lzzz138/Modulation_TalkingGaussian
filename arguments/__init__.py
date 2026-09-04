@@ -57,6 +57,7 @@ class ModelParams(ParamGroup):
         self.audio = ""
         self.init_num = 10_000
         self.audio_extractor = "deepspeech"
+        self.geometry_mod_multiscale = 1
         self.geometry_mod_map_res = 16
         self.geometry_mod_condition_scale = 0.1
         super().__init__(parser, "Loading Parameters", sentinel)
