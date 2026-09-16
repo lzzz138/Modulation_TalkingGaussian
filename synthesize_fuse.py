@@ -24,6 +24,7 @@ import copy
 from argparse import ArgumentParser
 from arguments import ModelParams, PipelineParams, get_combined_args
 from gaussian_renderer import GaussianModel, MotionNetwork, MouthMotionNetwork
+from scene.pose_refiner import PoseRefinementRuntime
 
 import torch.nn.functional as F
 
@@ -32,7 +33,7 @@ def dilate_fn(bin_img, ksize=13):
     out = F.max_pool2d(bin_img, kernel_size=ksize, stride=1, padding=pad)
     return out
 
-def render_set(model_path, name, iteration, views, gaussians, motion_net, gaussians_mouth, motion_net_mouth, pipeline, background, fast, dilate):
+def render_set(model_path, name, iteration, views, gaussians, motion_net, gaussians_mouth, motion_net_mouth, pipeline, background, fast, dilate, pose_runtime=None):
     render_path = os.path.join(model_path, name, "ours_{}".format(iteration), "renders")
     gts_path = os.path.join(model_path, name, "ours_{}".format(iteration), "gt")
 
@@ -50,8 +51,12 @@ def render_set(model_path, name, iteration, views, gaussians, motion_net, gaussi
         if view.original_image == None:
             view = loadCamOnTheFly(copy.deepcopy(view))
         with torch.no_grad():
-            render_pkg = render_motion(view, gaussians, motion_net, pipeline, background, frame_idx=0)
-            render_pkg_mouth = render_motion_mouth(view, gaussians_mouth, motion_net_mouth, pipeline, background, frame_idx=0)
+            refined_pose = pose_runtime.pose(view, "train" if name == "train" else "test", detach=True) if pose_runtime else None
+            render_pkg = render_motion(view, gaussians, motion_net, pipeline, background,
+                                       frame_idx=0, refined_pose=refined_pose)
+            render_pkg_mouth = render_motion_mouth(view, gaussians_mouth, motion_net_mouth,
+                                                   pipeline, background, frame_idx=0,
+                                                   refined_pose=refined_pose)
         # gt = view.original_image[0:3, :, :]
         # torchvision.utils.save_image(rendering, os.path.join(render_path, '{0:05d}'.format(idx) + ".png"))
         # torchvision.utils.save_image(gt, os.path.join(gts_path, '{0:05d}'.format(idx) + ".png"))
@@ -94,7 +99,25 @@ def render_sets(dataset : ModelParams, iteration : int, pipeline : PipelineParam
         motion_net = MotionNetwork(args=dataset).cuda()
         motion_net_mouth = MouthMotionNetwork(args=dataset).cuda()
 
-        (model_params, motion_params, model_mouth_params, motion_mouth_params) = torch.load(os.path.join(dataset.model_path, "chkpnt_fuse_latest.pth"))
+        checkpoint = torch.load(os.path.join(dataset.model_path, "chkpnt_fuse_latest.pth"))
+        pose_runtime = None
+        if isinstance(checkpoint, dict):
+            if "pose" not in checkpoint:
+                raise RuntimeError("Unsupported Fuse checkpoint dictionary")
+            model_params = checkpoint["face_gaussians"]
+            motion_params = checkpoint["face_motion"]
+            model_mouth_params = checkpoint["mouth_gaussians"]
+            motion_mouth_params = checkpoint["mouth_motion"]
+            pose_config = checkpoint["pose"]["config"]
+            pose_runtime = PoseRefinementRuntime(
+                scene.getTrainCameras(), scene.getTestCameras(), pose_config["window"],
+                pose_config["max_rotation_deg"], pose_config["max_translation_ratio"])
+            # --eval aliases validation cameras as train cameras; checkpoint
+            # statistics remain authoritative for inference.
+            pose_runtime.restore(checkpoint["pose"], strict_hash=False)
+            pose_runtime.refiner.eval()
+        else:
+            (model_params, motion_params, model_mouth_params, motion_mouth_params) = checkpoint
         motion_net.validate_multiscale_checkpoint(motion_params)
         motion_net.load_state_dict(motion_params, strict=False)
         gaussians.restore(model_params, None)
@@ -109,7 +132,7 @@ def render_sets(dataset : ModelParams, iteration : int, pipeline : PipelineParam
         bg_color = [1,1,1] if dataset.white_background else [0, 0, 0]
         background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
         
-        render_set(dataset.model_path, "test" if not use_train else "train", scene.loaded_iter, scene.getTestCameras() if not use_train else scene.getTrainCameras(), gaussians, motion_net, gaussians_mouth, motion_net_mouth, pipeline, background, fast, dilate)
+        render_set(dataset.model_path, "test" if not use_train else "train", scene.loaded_iter, scene.getTestCameras() if not use_train else scene.getTrainCameras(), gaussians, motion_net, gaussians_mouth, motion_net_mouth, pipeline, background, fast, dilate, pose_runtime)
 
 if __name__ == "__main__":
     # Set up command line argument parser

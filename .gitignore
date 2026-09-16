@@ -19,4 +19,5 @@ tensorboard_3d
 screenshots
 
 data/*
+figures/
 !*.gitkeep

@@ -582,6 +582,40 @@ class VideoMetricsCalculator:
         return np.stack(results, axis=0)
 
     @staticmethod
+    def calculate_lmd_from_landmarks(gen_lms, real_lms, lmd_region='mouth'):
+        """Compute LMD with the same definition used by ``metrics.py``.
+
+        Each frame is centered independently over the selected landmarks,
+        then the point-wise Euclidean distances are averaged over landmarks
+        and valid frames. The returned value is in pixels.
+        """
+        if gen_lms is None or real_lms is None:
+            return None
+        min_len = min(len(gen_lms), len(real_lms))
+        gen = np.asarray(gen_lms[:min_len], dtype=np.float32)
+        real = np.asarray(real_lms[:min_len], dtype=np.float32)
+        valid = (
+            np.isfinite(gen).all(axis=(1, 2))
+            & np.isfinite(real).all(axis=(1, 2))
+        )
+        if not valid.any():
+            return 0.0
+
+        if lmd_region == 'mouth':
+            indices = np.arange(48, 68)
+        elif lmd_region in ('all', 'face'):
+            indices = np.arange(68)
+        else:
+            raise ValueError('lmd_region must be "mouth", "all", or "face".')
+
+        gen = gen[valid][:, indices]
+        real = real[valid][:, indices]
+        gen = gen - gen.mean(axis=1, keepdims=True)
+        real = real - real.mean(axis=1, keepdims=True)
+        distance = np.sqrt(((gen - real) ** 2).sum(axis=-1)).mean(axis=-1)
+        return float(distance.mean())
+
+    @staticmethod
     def calculate_lmd_auc_from_landmarks(gen_lms, real_lms, lmd_region='mouth', auc_threshold=0.08):
         if gen_lms is None or real_lms is None:
             return None
@@ -590,31 +624,153 @@ class VideoMetricsCalculator:
         real_lms = real_lms[:min_len]
         valid = np.isfinite(gen_lms).all(axis=(1, 2)) & np.isfinite(real_lms).all(axis=(1, 2))
         if not valid.any():
-            return {'lmd': 0.0, 'auc': 0.0, 'failure_rate': 1.0, 'valid_frames': 0}
+            return {
+                'lmd': 0.0,
+                'lmd_normalized': 0.0,
+                'auc': 0.0,
+                'failure_rate': 1.0,
+                'valid_frames': 0,
+            }
 
         gen = gen_lms[valid]
         real = real_lms[valid]
+        if auc_threshold <= 0.0:
+            raise ValueError('auc_threshold must be positive.')
         if lmd_region == 'mouth':
             idx = np.arange(48, 68)
-        else:
+        elif lmd_region == 'all':
             idx = np.arange(68)
+        else:
+            raise ValueError('lmd_region must be "mouth" or "all".')
 
         gen_region = gen[:, idx] - gen[:, idx].mean(axis=1, keepdims=True)
         real_region = real[:, idx] - real[:, idx].mean(axis=1, keepdims=True)
-        lmd = np.linalg.norm(gen_region - real_region, axis=-1).mean()
-
         iod = np.linalg.norm(real[:, 36] - real[:, 45], axis=-1)
         iod = np.maximum(iod, 1e-6)
-        nme = np.linalg.norm(gen - real, axis=-1).mean(axis=-1) / iod
+        frame_lmd = np.linalg.norm(gen_region - real_region, axis=-1).mean(axis=-1)
+        # Keep the primary LMD exactly aligned with the legacy LMDMeter in
+        # metrics.py. Normalized LMD/AUC below are additional diagnostics.
+        lmd = VideoMetricsCalculator.calculate_lmd_from_landmarks(
+            gen_lms, real_lms, lmd_region=lmd_region
+        )
+        lmd_normalized = (frame_lmd / iod).mean()
+        nme = frame_lmd / iod
         xs = np.linspace(0.0, auc_threshold, 100)
         ced = np.asarray([(nme <= x).mean() for x in xs], dtype=np.float32)
         auc = np.trapz(ced, xs) / auc_threshold
         failure_rate = float((nme > auc_threshold).mean())
         return {
             'lmd': float(lmd),
+            'lmd_normalized': float(lmd_normalized),
             'auc': float(auc),
             'failure_rate': failure_rate,
             'valid_frames': int(valid.sum()),
+        }
+
+    @staticmethod
+    def calculate_gaussianheadtalk_stability(
+        gen_lms,
+        real_lms,
+        high_frequency_ratio=0.25,
+    ):
+        """GaussianHeadTalk-style nose-keypoint temporal stability.
+
+        The paper defines Stability=(Md+Vm+Hf)/3 using nose trajectories,
+        motion variability, and FFT high-frequency power, but does not publish
+        its low-level formula or frequency cutoff. This implementation makes
+        those choices explicit: FAN-68 nose points 27:36, generated-minus-real
+        motion residuals normalized by real interocular distance, and the top
+        ``high_frequency_ratio`` of non-DC FFT bins.
+        """
+        if gen_lms is None or real_lms is None:
+            return None
+        if not 0.0 < high_frequency_ratio <= 1.0:
+            raise ValueError('high_frequency_ratio must be in (0, 1].')
+
+        def empty_result():
+            return {
+                'score': 0.0,
+                'mean_motion_difference': 0.0,
+                'motion_variability': 0.0,
+                'high_frequency_power': 0.0,
+                'mean_motion_difference_normalized': 0.0,
+                'motion_variability_normalized': 0.0,
+                'high_frequency_power_normalized': 0.0,
+                'valid_frames': 0,
+                'high_frequency_ratio': float(high_frequency_ratio),
+            }
+
+        min_len = min(len(gen_lms), len(real_lms))
+        if min_len < 3:
+            return empty_result()
+
+        gen = np.asarray(gen_lms[:min_len], dtype=np.float32)
+        real = np.asarray(real_lms[:min_len], dtype=np.float32)
+        valid = (
+            np.isfinite(gen).all(axis=(1, 2))
+            & np.isfinite(real).all(axis=(1, 2))
+        )
+
+        # FFT requires a contiguous signal. Use the longest valid run instead
+        # of interpolating across failed landmark detections.
+        padded = np.concatenate(([False], valid, [False])).astype(np.int8)
+        transitions = np.diff(padded)
+        starts = np.where(transitions == 1)[0]
+        ends = np.where(transitions == -1)[0]
+        if len(starts) == 0:
+            return empty_result()
+        lengths = ends - starts
+        run = int(np.argmax(lengths))
+        start, end = int(starts[run]), int(ends[run])
+        if end - start < 3:
+            return empty_result()
+
+        nose = np.arange(27, 36)
+        iod = np.linalg.norm(
+            real[start:end, 36] - real[start:end, 45], axis=-1
+        ).astype(np.float32)
+        gen = gen[start:end, nose]
+        real = real[start:end, nose]
+        iod = np.maximum(iod, 1e-6)
+
+        gen_velocity = gen[1:] - gen[:-1]
+        real_velocity = real[1:] - real[:-1]
+        velocity_residual = (gen_velocity - real_velocity) / iod[1:, None, None]
+        motion_error = np.linalg.norm(velocity_residual, axis=-1)
+        mean_motion_difference = float(motion_error.mean())
+        motion_variability = float(motion_error.std())
+        motion_scale = max(float(motion_error.max()), 1e-8)
+        md_normalized = mean_motion_difference / motion_scale
+        vm_normalized = motion_variability / motion_scale
+
+        position_residual = (gen - real) / iod[:, None, None]
+        position_residual -= position_residual.mean(axis=0, keepdims=True)
+        spectrum = np.fft.rfft(position_residual, axis=0)
+        power = np.abs(spectrum) ** 2 / max(position_residual.shape[0] ** 2, 1)
+        non_dc_power = power[1:]
+        if non_dc_power.shape[0] == 0:
+            high_frequency_power = 0.0
+            hf_normalized = 0.0
+        else:
+            high_bin_count = max(
+                1, int(math.ceil(non_dc_power.shape[0] * high_frequency_ratio))
+            )
+            high_power = non_dc_power[-high_bin_count:]
+            high_frequency_power = float(np.sqrt(high_power.mean()))
+            power_scale = max(float(np.sqrt(non_dc_power.max())), 1e-8)
+            hf_normalized = high_frequency_power / power_scale
+
+        score = (md_normalized + vm_normalized + hf_normalized) / 3.0
+        return {
+            'score': float(score),
+            'mean_motion_difference': mean_motion_difference,
+            'motion_variability': motion_variability,
+            'high_frequency_power': high_frequency_power,
+            'mean_motion_difference_normalized': float(md_normalized),
+            'motion_variability_normalized': float(vm_normalized),
+            'high_frequency_power_normalized': float(hf_normalized),
+            'valid_frames': int(end - start),
+            'high_frequency_ratio': float(high_frequency_ratio),
         }
 
     @staticmethod
@@ -770,8 +926,8 @@ class VideoMetricsCalculator:
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('gen_video', nargs='?', default='/home/lzq/paperCode/talkinghead/TalkingGaussian/output/exp_adaptive/test/ours_None/renders/out.mp4')
-    parser.add_argument('real_video', nargs='?', default='/home/lzq/paperCode/talkinghead/TalkingGaussian/output/pose/test/ours_None/gt/out.mp4')
+    parser.add_argument('gen_video', nargs='?', default='/home/lzq/paperCode/talkinghead/TalkingGaussian/output/posevideo_pose_refinement/test/ours_None/renders/out.mp4')
+    parser.add_argument('real_video', nargs='?', default='/home/lzq/paperCode/talkinghead/TalkingGaussian/output/posevideo_pose_refinement/test/ours_None/gt/out.mp4')
     parser.add_argument('--device', default='cuda')
     parser.add_argument('--batch_size', type=int, default=32)
     parser.add_argument('--max_frames', type=int, default=None)
@@ -783,6 +939,12 @@ def main():
     parser.add_argument('--flow_max_side', type=int, default=512)
     parser.add_argument('--flow_fb_threshold', type=float, default=1.5)
     parser.add_argument('--flow_region', choices=['face', 'full'], default='full')
+    parser.add_argument('--lmd_region', choices=['mouth', 'all'], default='mouth')
+    parser.add_argument('--lmd_auc_threshold', type=float, default=0.08)
+    parser.add_argument(
+        '--stability_high_frequency_ratio', type=float, default=0.25,
+        help='Top fraction of non-DC FFT bins used by Stability (default: 0.25).',
+    )
     args = parser.parse_args()
 
     if not os.path.exists(args.gen_video) or not os.path.exists(args.real_video):
@@ -828,6 +990,62 @@ def main():
         calculator.extract_fan_landmarks(frames_gen, name='gen')
         if real_lms is not None else None
     )
+
+    print('\n[METRIC] Landmark Distance')
+    lmd = calculator.calculate_lmd_auc_from_landmarks(
+        gen_lms,
+        real_lms,
+        lmd_region=args.lmd_region,
+        auc_threshold=args.lmd_auc_threshold,
+    )
+    if lmd is None:
+        print('LMD: skipped (FAN-68 is unavailable)')
+    else:
+        print('LMD_source: FAN-68')
+        print(f'LMD_region: {args.lmd_region}')
+        print(f'LMD_px: {lmd["lmd"]:.6f}')
+        print(f'LMD_normalized: {lmd["lmd_normalized"]:.6f}')
+        print(f'LMD_AUC@{args.lmd_auc_threshold:g}: {lmd["auc"]:.6f}')
+        print(f'LMD_failure_rate: {lmd["failure_rate"]:.6f}')
+        print(f'LMD_valid_frames: {lmd["valid_frames"]}')
+
+    print('\n[METRIC] Stability')
+    stability = calculator.calculate_gaussianheadtalk_stability(
+        gen_lms,
+        real_lms,
+        high_frequency_ratio=args.stability_high_frequency_ratio,
+    )
+    if stability is None:
+        print('Stability: skipped (FAN-68 is unavailable)')
+    else:
+        print('Stability_protocol: GaussianHeadTalk-style FAN-68 nose trajectory')
+        print(f'Stability: {stability["score"]:.6f} (lower is better)')
+        print(
+            'Stability_Md: %.6f (normalized %.6f)'
+            % (
+                stability['mean_motion_difference'],
+                stability['mean_motion_difference_normalized'],
+            )
+        )
+        print(
+            'Stability_Vm: %.6f (normalized %.6f)'
+            % (
+                stability['motion_variability'],
+                stability['motion_variability_normalized'],
+            )
+        )
+        print(
+            'Stability_Hf: %.6f (normalized %.6f)'
+            % (
+                stability['high_frequency_power'],
+                stability['high_frequency_power_normalized'],
+            )
+        )
+        print(f'Stability_valid_frames: {stability["valid_frames"]}')
+        print(
+            'Stability_high_frequency_ratio: '
+            f'{stability["high_frequency_ratio"]:.6f}'
+        )
 
     print('\n[METRIC] Landmark Velocity Distance')
     if gen_lms is not None and real_lms is not None:

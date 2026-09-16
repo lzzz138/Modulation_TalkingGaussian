@@ -17,6 +17,7 @@ from utils.loss_utils import l1_loss, l2_loss, patchify, ssim
 from gaussian_renderer import render, render_motion, render_motion_mouth
 import sys
 from scene import Scene, GaussianModel, MouthMotionNetwork
+from scene.pose_refiner import PoseRefinementRuntime
 from utils.general_utils import safe_state
 import lpips
 import uuid
@@ -25,6 +26,7 @@ from utils.image_utils import psnr
 from argparse import ArgumentParser, Namespace
 from arguments import ModelParams, PipelineParams, OptimizationParams
 from utils.camera_utils import loadCamOnTheFly
+from utils.checkpoint_utils import capture_rng_state, camera_stack_from_ids, restore_rng_state
 import copy
 
 SummaryWriter = None
@@ -58,8 +60,36 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     lpips_criterion = lpips.LPIPS(net='alex').eval().cuda()
 
     gaussians.training_setup(opt)
+    pose_runtime = None
+    if dataset.pose_refinement:
+        pose_path = dataset.pose_checkpoint or os.path.join(scene.model_path, "chkpnt_face_latest.pth")
+        face_checkpoint = torch.load(pose_path)
+        if not isinstance(face_checkpoint, dict) or "pose" not in face_checkpoint:
+            raise RuntimeError("Mouth pose mode requires a pose-enabled Face checkpoint")
+        pose_config = face_checkpoint["pose"]["config"]
+        pose_runtime = PoseRefinementRuntime(
+            scene.getTrainCameras(), scene.getTestCameras(), pose_config["window"],
+            pose_config["max_rotation_deg"], pose_config["max_translation_ratio"])
+        pose_runtime.restore(face_checkpoint["pose"])
+        pose_runtime.refiner.eval()
+        for parameter in pose_runtime.refiner.parameters():
+            parameter.requires_grad_(False)
+    checkpoint_data = torch.load(checkpoint) if checkpoint else None
     if checkpoint:
-        (model_params, motion_params, motion_optimizer_params, first_iter) = torch.load(checkpoint)
+        if isinstance(checkpoint_data, dict):
+            if not pose_runtime or "pose" not in checkpoint_data:
+                raise RuntimeError("Pose Mouth checkpoint requires --pose_refinement")
+            model_params = checkpoint_data["gaussians"]
+            motion_params = checkpoint_data["motion"]
+            motion_optimizer_params = checkpoint_data["motion_optimizer"]
+            first_iter = checkpoint_data["iteration"]
+            pose_runtime.restore(checkpoint_data["pose"])
+            if checkpoint_data.get("motion_scheduler"):
+                scheduler.load_state_dict(checkpoint_data["motion_scheduler"])
+        else:
+            if dataset.pose_refinement:
+                raise RuntimeError("Legacy Mouth checkpoint cannot resume pose-refinement mode")
+            (model_params, motion_params, motion_optimizer_params, first_iter) = checkpoint_data
         gaussians.restore(model_params, opt)
         motion_net.load_state_dict(motion_params)
         motion_optimizer.load_state_dict(motion_optimizer_params)
@@ -72,6 +102,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     iter_end = torch.cuda.Event(enable_timing = True)
 
     viewpoint_stack = None
+    if isinstance(checkpoint_data, dict):
+        if checkpoint_data.get("sampling_ids") is not None:
+            viewpoint_stack = camera_stack_from_ids(scene.getTrainCameras(), checkpoint_data["sampling_ids"])
+        restore_rng_state(checkpoint_data.get("rng_state"))
     ema_loss_for_log = 0.0
     progress_bar = tqdm(range(first_iter, opt.iterations), ascii=True, dynamic_ncols=True, desc="Training progress")
     first_iter += 1
@@ -125,6 +159,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         if viewpoint_cam.original_image == None:
             viewpoint_cam = loadCamOnTheFly(copy.deepcopy(viewpoint_cam))
 
+        refined_pose = pose_runtime.pose(viewpoint_cam, "train", detach=True) if pose_runtime else None
+
         # Render
         if (iteration - 1) == debug_from:
             pipe.debug = True
@@ -144,9 +180,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         lips_mask[xmin:xmax, ymin:ymax] = True
 
         if iteration < warm_step:
-            render_pkg = render(viewpoint_cam, gaussians, pipe, background)
+            render_pkg = render(viewpoint_cam, gaussians, pipe, background, refined_pose=refined_pose)
         else:
-            render_pkg = render_motion_mouth(viewpoint_cam, gaussians, motion_net, pipe, background)
+            render_pkg = render_motion_mouth(viewpoint_cam, gaussians, motion_net, pipe, background,
+                                             refined_pose=refined_pose)
 
         image_green, alpha, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["alpha"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
         
@@ -202,14 +239,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 scene.save(str(iteration)+'_mouth')
 
             # Log and save
-            training_report(tb_writer, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, motion_net, render if iteration < warm_step else render_motion_mouth, (pipe, background))
-            if (iteration in checkpoint_iterations):
-                print("\n[ITER {}] Saving Checkpoint".format(iteration))
-                ckpt = (gaussians.capture(), motion_net.state_dict(), motion_optimizer.state_dict(), iteration)
-                torch.save(ckpt, scene.model_path + "/chkpnt_mouth_" + str(iteration) + ".pth")
-                torch.save(ckpt, scene.model_path + "/chkpnt_mouth_latest" + ".pth")
-
-
+            training_report(tb_writer, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, motion_net, render if iteration < warm_step else render_motion_mouth, (pipe, background), pose_runtime)
             # Densification
             if iteration < opt.densify_until_iter:
                 # Keep track of max radii in image-space for pruning
@@ -221,7 +251,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     gaussians.densify_and_prune(opt.densify_grad_threshold, 0.05 + 0.25 * iteration / opt.densify_until_iter, scene.cameras_extent, size_threshold)
 
                     shs_view = gaussians.get_features.transpose(1, 2).view(-1, 3, (gaussians.max_sh_degree+1)**2)
-                    dir_pp = (gaussians.get_xyz - viewpoint_cam.camera_center.repeat(gaussians.get_features.shape[0], 1))
+                    active_center = refined_pose.camera_center if refined_pose is not None else viewpoint_cam.camera_center
+                    dir_pp = (gaussians.get_xyz - active_center.repeat(gaussians.get_features.shape[0], 1))
                     dir_pp_normalized = dir_pp/dir_pp.norm(dim=1, keepdim=True)
                     from utils.sh_utils import eval_sh
                     sh2rgb = eval_sh(gaussians.active_sh_degree, shs_view, dir_pp_normalized)
@@ -244,6 +275,25 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 gaussians.optimizer.zero_grad(set_to_none = True)
 
                 scheduler.step()
+
+            if iteration in checkpoint_iterations:
+                print("\n[ITER {}] Saving Checkpoint".format(iteration))
+                if pose_runtime:
+                    ckpt = {
+                        "format": "talking_gaussian_mouth_pose_v1",
+                        "gaussians": gaussians.capture(),
+                        "motion": motion_net.state_dict(),
+                        "motion_optimizer": motion_optimizer.state_dict(),
+                        "motion_scheduler": scheduler.state_dict(),
+                        "pose": pose_runtime.checkpoint(),
+                        "sampling_ids": [int(camera.talking_dict["img_id"]) for camera in (viewpoint_stack or [])],
+                        "rng_state": capture_rng_state(),
+                        "iteration": iteration,
+                    }
+                else:
+                    ckpt = (gaussians.capture(), motion_net.state_dict(), motion_optimizer.state_dict(), iteration)
+                torch.save(ckpt, scene.model_path + "/chkpnt_mouth_" + str(iteration) + ".pth")
+                torch.save(ckpt, scene.model_path + "/chkpnt_mouth_latest" + ".pth")
 
 
 
@@ -269,7 +319,7 @@ def prepare_output_and_logger(args):
         print("Tensorboard not available: not logging progress")
     return tb_writer
 
-def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_iterations, scene : Scene, motion_net, renderFunc, renderArgs):
+def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_iterations, scene : Scene, motion_net, renderFunc, renderArgs, pose_runtime=None):
     # Report test and samples of training set
     if iteration in testing_iterations:
         torch.cuda.empty_cache()
@@ -284,10 +334,11 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_i
                     if viewpoint.original_image == None:
                         viewpoint = loadCamOnTheFly(copy.deepcopy(viewpoint))
                         
+                    refined_pose = pose_runtime.pose(viewpoint, "test" if config['name'] == 'test' else "train", detach=True) if pose_runtime else None
                     if renderFunc is render:
-                        render_pkg = renderFunc(viewpoint, scene.gaussians, *renderArgs)
+                        render_pkg = renderFunc(viewpoint, scene.gaussians, *renderArgs, refined_pose=refined_pose)
                     else:
-                        render_pkg = renderFunc(viewpoint, scene.gaussians, motion_net, *renderArgs)
+                        render_pkg = renderFunc(viewpoint, scene.gaussians, motion_net, *renderArgs, refined_pose=refined_pose)
 
                     image = torch.clamp(render_pkg["render"], 0.0, 1.0)
                     alpha = render_pkg["alpha"]

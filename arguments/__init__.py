@@ -60,6 +60,8 @@ class ModelParams(ParamGroup):
         self.geometry_mod_multiscale = 1
         self.geometry_mod_map_res = 16
         self.geometry_mod_condition_scale = 0.1
+        self.pose_refinement = False
+        self.pose_checkpoint = ""
         super().__init__(parser, "Loading Parameters", sentinel)
 
     def extract(self, args):
@@ -99,6 +101,17 @@ class OptimizationParams(ParamGroup):
         self.geometry_mod_warmup_steps = 3000
         self.geometry_mod_tv_weight = 1e-5
         self.geometry_mod_gate_weight = 1e-5
+        self.pose_start_iter = 5000
+        self.pose_stop_iter = 45000
+        self.pose_window = 9
+        self.pose_lr = 1e-4
+        self.pose_lr_final = 1e-5
+        self.pose_max_rotation_deg = 5.0
+        self.pose_max_translation_ratio = 0.02
+        self.lambda_pose_prior = 1e-3
+        self.lambda_pose_temporal = 1e-2
+        self.lambda_pose_silhouette = 0.1
+        self.pose_grad_clip = 1.0
         super().__init__(parser, "Optimization Parameters")
 
 def get_combined_args(parser : ArgumentParser):

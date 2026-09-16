@@ -17,6 +17,7 @@ from utils.loss_utils import l1_loss, l2_loss, patchify, ssim
 from gaussian_renderer import render, render_motion, render_motion_mouth
 import sys
 from scene import Scene, GaussianModel, MotionNetwork, MouthMotionNetwork
+from scene.pose_refiner import PoseRefinementRuntime
 from utils.general_utils import safe_state
 import lpips
 import uuid
@@ -57,12 +58,41 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     gaussians.training_setup(opt)
     gaussians_mouth.training_setup(opt)
 
-    (model_params, motion_params, _, _) = torch.load(os.path.join(scene.model_path, "chkpnt_face_latest.pth"))
+    face_checkpoint = torch.load(os.path.join(scene.model_path, "chkpnt_face_latest.pth"))
+    pose_runtime = None
+    if isinstance(face_checkpoint, dict):
+        if not dataset.pose_refinement or "pose" not in face_checkpoint:
+            raise RuntimeError("Pose-enabled Face checkpoint requires --pose_refinement")
+        model_params, motion_params = face_checkpoint["gaussians"], face_checkpoint["motion"]
+        pose_config = face_checkpoint["pose"]["config"]
+        pose_runtime = PoseRefinementRuntime(
+            scene.getTrainCameras(), scene.getTestCameras(), pose_config["window"],
+            pose_config["max_rotation_deg"], pose_config["max_translation_ratio"])
+        pose_runtime.restore(face_checkpoint["pose"])
+        pose_runtime.refiner.eval()
+        for parameter in pose_runtime.refiner.parameters():
+            parameter.requires_grad_(False)
+    else:
+        if dataset.pose_refinement:
+            raise RuntimeError("Legacy Face checkpoint cannot be used in pose-refinement Fuse mode")
+        (model_params, motion_params, _, _) = face_checkpoint
     gaussians.restore(model_params, opt)
     motion_net.validate_multiscale_checkpoint(motion_params)
     motion_net.load_state_dict(motion_params)
 
-    (model_params, motion_params, _, _) = torch.load(os.path.join(scene.model_path, "chkpnt_mouth_latest.pth"))
+    mouth_checkpoint = torch.load(os.path.join(scene.model_path, "chkpnt_mouth_latest.pth"))
+    if isinstance(mouth_checkpoint, dict):
+        if not pose_runtime or "pose" not in mouth_checkpoint:
+            raise RuntimeError("Face and Mouth checkpoint modes do not match")
+        if mouth_checkpoint["pose"]["transform_hash"] != face_checkpoint["pose"]["transform_hash"]:
+            raise RuntimeError("Face and Mouth checkpoints use different pose trajectories")
+        if mouth_checkpoint["pose"].get("state_hash") != face_checkpoint["pose"].get("state_hash"):
+            raise RuntimeError("Face and Mouth checkpoints contain different PoseRefiner weights")
+        model_params, motion_params = mouth_checkpoint["gaussians"], mouth_checkpoint["motion"]
+    else:
+        if pose_runtime:
+            raise RuntimeError("Face and Mouth checkpoint modes do not match")
+        (model_params, motion_params, _, _) = mouth_checkpoint
     gaussians_mouth.restore(model_params, opt)
     motion_net_mouth.load_state_dict(motion_params)
 
@@ -90,6 +120,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         viewpoint_cam = viewpoint_stack.pop(randint(0, len(viewpoint_stack)-1))
         if viewpoint_cam.original_image == None:
             viewpoint_cam = loadCamOnTheFly(copy.deepcopy(viewpoint_cam))
+        refined_pose = pose_runtime.pose(viewpoint_cam, "train", detach=True) if pose_runtime else None
 
         gaussians.update_learning_rate(iteration)
 
@@ -102,8 +133,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         if (iteration - 1) == debug_from:
             pipe.debug = True
 
-        render_pkg = render_motion(viewpoint_cam, gaussians, motion_net, pipe, background)
-        render_pkg_mouth = render_motion_mouth(viewpoint_cam, gaussians_mouth, motion_net_mouth, pipe, background)
+        render_pkg = render_motion(viewpoint_cam, gaussians, motion_net, pipe, background,
+                                   refined_pose=refined_pose)
+        render_pkg_mouth = render_motion_mouth(viewpoint_cam, gaussians_mouth, motion_net_mouth,
+                                               pipe, background, refined_pose=refined_pose)
         viewspace_point_tensor, visibility_filter = render_pkg["viewspace_points"], render_pkg["visibility_filter"]
         viewspace_point_tensor_mouth, visibility_filter_mouth = render_pkg_mouth["viewspace_points"], render_pkg_mouth["visibility_filter"]
 
@@ -184,7 +217,17 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
             if (iteration in checkpoint_iterations):
                 print("\n[ITER {}] Saving Checkpoint".format(iteration))
-                ckpt = (gaussians.capture(), motion_net.state_dict(), gaussians_mouth.capture(), motion_net_mouth.state_dict())
+                if pose_runtime:
+                    ckpt = {
+                        "format": "talking_gaussian_fuse_pose_v1",
+                        "face_gaussians": gaussians.capture(),
+                        "face_motion": motion_net.state_dict(),
+                        "mouth_gaussians": gaussians_mouth.capture(),
+                        "mouth_motion": motion_net_mouth.state_dict(),
+                        "pose": pose_runtime.checkpoint(),
+                    }
+                else:
+                    ckpt = (gaussians.capture(), motion_net.state_dict(), gaussians_mouth.capture(), motion_net_mouth.state_dict())
                 torch.save(ckpt, scene.model_path + "/chkpnt_fuse_" + str(iteration) + ".pth")
                 torch.save(ckpt, scene.model_path + "/chkpnt_fuse_latest" + ".pth")
 
