@@ -17,7 +17,6 @@ from utils.loss_utils import l1_loss, l2_loss, patchify, ssim
 from gaussian_renderer import render, render_motion
 import sys
 from scene import Scene, GaussianModel, MotionNetwork
-from scene.pose_refiner import PoseRefinementRuntime
 from utils.general_utils import safe_state
 import lpips
 import uuid
@@ -26,7 +25,6 @@ from utils.image_utils import psnr
 from argparse import ArgumentParser, Namespace
 from arguments import ModelParams, PipelineParams, OptimizationParams
 from utils.camera_utils import loadCamOnTheFly
-from utils.checkpoint_utils import capture_rng_state, camera_stack_from_ids, restore_rng_state
 import copy
 
 SummaryWriter = None
@@ -65,47 +63,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     lpips_criterion = lpips.LPIPS(net='alex').eval().cuda()
 
     gaussians.training_setup(opt)
-    checkpoint_data = torch.load(checkpoint) if checkpoint else None
-    pose_training_keys = (
-        "pose_start_iter", "pose_stop_iter", "pose_lr", "pose_lr_final",
-        "lambda_pose_prior", "lambda_pose_temporal",
-        "lambda_pose_silhouette",
-        "pose_grad_clip",
-    )
-    if isinstance(checkpoint_data, dict) and checkpoint_data.get("pose_training"):
-        for key in pose_training_keys:
-            if key in checkpoint_data["pose_training"]:
-                setattr(opt, key, checkpoint_data["pose_training"][key])
-    pose_runtime = None
-    pose_optimizer = None
-    if dataset.pose_refinement:
-        pose_config = checkpoint_data["pose"]["config"] if isinstance(checkpoint_data, dict) else {
-            "window": opt.pose_window,
-            "max_rotation_deg": opt.pose_max_rotation_deg,
-            "max_translation_ratio": opt.pose_max_translation_ratio,
-        }
-        pose_runtime = PoseRefinementRuntime(
-            scene.getTrainCameras(), scene.getTestCameras(), pose_config["window"],
-            pose_config["max_rotation_deg"], pose_config["max_translation_ratio"])
-        pose_optimizer = torch.optim.AdamW(pose_runtime.refiner.parameters(), lr=opt.pose_lr,
-                                           betas=(0.9, 0.99), weight_decay=1e-6)
     if checkpoint:
-        if isinstance(checkpoint_data, dict):
-            if not dataset.pose_refinement or "pose" not in checkpoint_data:
-                raise RuntimeError("Pose checkpoint requires --pose_refinement")
-            model_params = checkpoint_data["gaussians"]
-            motion_params = checkpoint_data["motion"]
-            motion_optimizer_params = checkpoint_data["motion_optimizer"]
-            first_iter = checkpoint_data["iteration"]
-            pose_runtime.restore(checkpoint_data["pose"])
-            if checkpoint_data["pose"].get("optimizer"):
-                pose_optimizer.load_state_dict(checkpoint_data["pose"]["optimizer"])
-            if checkpoint_data.get("motion_scheduler"):
-                scheduler.load_state_dict(checkpoint_data["motion_scheduler"])
-        else:
-            if dataset.pose_refinement:
-                raise RuntimeError("Legacy Face checkpoint cannot resume pose-refinement mode")
-            (model_params, motion_params, motion_optimizer_params, first_iter) = checkpoint_data
+        (model_params, motion_params, motion_optimizer_params, first_iter) = torch.load(checkpoint)
         gaussians.restore(model_params, opt)
         motion_net.validate_multiscale_checkpoint(motion_params)
         motion_net.load_state_dict(motion_params, strict=False)
@@ -122,10 +81,6 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     iter_end = torch.cuda.Event(enable_timing = True)
 
     viewpoint_stack = None
-    if isinstance(checkpoint_data, dict):
-        if checkpoint_data.get("sampling_ids") is not None:
-            viewpoint_stack = camera_stack_from_ids(scene.getTrainCameras(), checkpoint_data["sampling_ids"])
-        restore_rng_state(checkpoint_data.get("rng_state"))
     ema_loss_for_log = 0.0
     progress_bar = tqdm(range(first_iter, opt.iterations), ascii=True, dynamic_ncols=True, desc="Training progress")
     first_iter += 1
@@ -183,20 +138,6 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         if viewpoint_cam.original_image == None:
             viewpoint_cam = loadCamOnTheFly(copy.deepcopy(viewpoint_cam))
 
-        pose_active = bool(pose_runtime and opt.pose_start_iter <= iteration <= opt.pose_stop_iter)
-        refined_pose = None
-        if pose_runtime and iteration >= opt.pose_start_iter:
-            refined_pose = pose_runtime.pose(viewpoint_cam, "train", detach=not pose_active)
-        if pose_optimizer:
-            if pose_active:
-                progress = (iteration - opt.pose_start_iter) / max(1, opt.pose_stop_iter - opt.pose_start_iter)
-                warmup = min(1.0, (iteration - opt.pose_start_iter + 1) / 500.0)
-                lr = opt.pose_lr * ((opt.pose_lr_final / opt.pose_lr) ** progress) * warmup
-            else:
-                lr = 0.0
-            for group in pose_optimizer.param_groups:
-                group["lr"] = lr
-
         # Render
         if (iteration - 1) == debug_from:
             pipe.debug = True
@@ -214,13 +155,12 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         hair_mask_iter = (warm_step < iteration < lpips_start_iter - 1000) and iteration % hair_mask_interval != 0
 
         if iteration < warm_step:
-            render_pkg = render(viewpoint_cam, gaussians, pipe, background, refined_pose=refined_pose)
+            render_pkg = render(viewpoint_cam, gaussians, pipe, background)
         else:
             mod_step = max(0, iteration - warm_step)
             mod_strength = min(1.0, mod_step / max(1, opt.geometry_mod_warmup_steps))
             motion_net.set_geometry_modulation_strength(mod_strength)
-            render_pkg = render_motion(viewpoint_cam, gaussians, motion_net, pipe, background,
-                                       return_attn=True, refined_pose=refined_pose)
+            render_pkg = render_motion(viewpoint_cam, gaussians, motion_net, pipe, background, return_attn=True)
 
         image_white, alpha, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["alpha"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
         
@@ -272,18 +212,6 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     loss += 1e-4 * (render_pkg["attn"][1][hair_mask]).mean()
                     loss += 1e-4 * (render_pkg["attn"][0][hair_mask]).mean()
 
-            if pose_active:
-                head_float = head_mask.float()[None, None]
-                dilated = torch.nn.functional.max_pool2d(head_float, 7, stride=1, padding=3)
-                eroded = -torch.nn.functional.max_pool2d(-head_float, 7, stride=1, padding=3)
-                boundary = (dilated - eroded)[0]
-                silhouette_loss = ((alpha - head_mask.float()).abs() * boundary).sum() / boundary.sum().clamp_min(1.0)
-                pose_prior = refined_pose.normalized_delta.square().mean()
-                pose_temporal = pose_runtime.temporal_loss(viewpoint_cam, "train")
-                loss += opt.lambda_pose_silhouette * silhouette_loss
-                loss += opt.lambda_pose_prior * pose_prior
-                loss += opt.lambda_pose_temporal * pose_temporal
-
                 # loss += l2_loss(image_white[:, xmin:xmax, ymin:ymax], image_white[:, xmin:xmax, ymin:ymax])
 
             image_t = image_white.clone()
@@ -314,27 +242,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
         loss.backward()
 
-        if pose_active:
-            torch.nn.utils.clip_grad_norm_(pose_runtime.refiner.parameters(), opt.pose_grad_clip)
-
         iter_end.record()
 
         with torch.no_grad():
-            if pose_active and iteration % 200 == 0:
-                pose_grad_sq = sum(
-                    parameter.grad.detach().square().sum()
-                    for parameter in pose_runtime.refiner.parameters()
-                    if parameter.grad is not None
-                )
-                pose_grad_norm = torch.sqrt(pose_grad_sq).item() if not isinstance(pose_grad_sq, int) else 0.0
-                rotation_deg = torch.linalg.norm(refined_pose.delta_xi[:3]).item() * 180.0 / 3.141592653589793
-                translation_ratio = torch.linalg.norm(refined_pose.delta_xi[3:]).item() / pose_runtime.median_depth
-                if tb_writer:
-                    tb_writer.add_scalar('pose/gradient_norm', pose_grad_norm, iteration)
-                    tb_writer.add_scalar('pose/rotation_deg', rotation_deg, iteration)
-                    tb_writer.add_scalar('pose/translation_ratio', translation_ratio, iteration)
-                    tb_writer.add_scalar('pose/silhouette_loss', silhouette_loss.item(), iteration)
-                    tb_writer.add_scalar('pose/temporal_loss', pose_temporal.item(), iteration)
             # Progress bar
             ema_loss_for_log = 0.4 * loss.item() + 0.6 * ema_loss_for_log
             if iteration % 10 == 0:
@@ -354,10 +264,17 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 progress_bar.close()
 
             # Log and save
-            training_report(tb_writer, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, motion_net, render if iteration < warm_step else render_motion, (pipe, background), pose_runtime, opt.pose_start_iter)
+            training_report(tb_writer, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, motion_net, render if iteration < warm_step else render_motion, (pipe, background))
             if (iteration in saving_iterations):
                 print("\n[ITER {}] Saving Gaussians".format(iteration))
                 scene.save(str(iteration)+'_face')
+
+            if (iteration in checkpoint_iterations):
+                print("\n[ITER {}] Saving Checkpoint".format(iteration))
+                ckpt = (gaussians.capture(), motion_net.state_dict(), motion_optimizer.state_dict(), iteration)
+                torch.save(ckpt, scene.model_path + "/chkpnt_face_" + str(iteration) + ".pth")
+                torch.save(ckpt, scene.model_path + "/chkpnt_face_latest" + ".pth")
+
 
             # Densification
             if iteration < opt.densify_until_iter:
@@ -375,8 +292,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 from utils.sh_utils import eval_sh
 
                 shs_view = gaussians.get_features.transpose(1, 2).view(-1, 3, (gaussians.max_sh_degree+1)**2)
-                active_center = refined_pose.camera_center if refined_pose is not None else viewpoint_cam.camera_center
-                dir_pp = (gaussians.get_xyz - active_center.repeat(gaussians.get_features.shape[0], 1))
+                dir_pp = (gaussians.get_xyz - viewpoint_cam.camera_center.repeat(gaussians.get_features.shape[0], 1))
                 dir_pp_normalized = dir_pp/dir_pp.norm(dim=1, keepdim=True)
                 sh2rgb = eval_sh(gaussians.active_sh_degree, shs_view, dir_pp_normalized)
                 colors_precomp = torch.clamp_min(sh2rgb + 0.5, 0.0)
@@ -394,39 +310,6 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 gaussians.optimizer.zero_grad(set_to_none = True)
 
                 scheduler.step()
-                if pose_optimizer and pose_active:
-                    pose_optimizer.step()
-                if pose_optimizer:
-                    pose_optimizer.zero_grad(set_to_none=True)
-
-            if iteration in checkpoint_iterations:
-                print("\n[ITER {}] Saving Checkpoint".format(iteration))
-                if pose_runtime:
-                    refined_tables = pose_runtime.export_tables() if iteration == opt.iterations else None
-                    ckpt = {
-                        "format": "talking_gaussian_face_pose_v1",
-                        "gaussians": gaussians.capture(),
-                        "motion": motion_net.state_dict(),
-                        "motion_optimizer": motion_optimizer.state_dict(),
-                        "motion_scheduler": scheduler.state_dict(),
-                        "pose": pose_runtime.checkpoint(pose_optimizer),
-                        "pose_training": {key: getattr(opt, key) for key in pose_training_keys},
-                        "refined_pose_tables": refined_tables,
-                        "sampling_ids": [int(camera.talking_dict["img_id"]) for camera in (viewpoint_stack or [])],
-                        "rng_state": capture_rng_state(),
-                        "iteration": iteration,
-                    }
-                    if refined_tables is not None:
-                        torch.save({
-                            "format": "talking_gaussian_refined_poses_v1",
-                            "train_transform_hash": pose_runtime.train_transform_hash,
-                            "state_hash": ckpt["pose"]["state_hash"],
-                            "world_to_camera": refined_tables,
-                        }, os.path.join(scene.model_path, "refined_poses.pt"))
-                else:
-                    ckpt = (gaussians.capture(), motion_net.state_dict(), motion_optimizer.state_dict(), iteration)
-                torch.save(ckpt, scene.model_path + "/chkpnt_face_" + str(iteration) + ".pth")
-                torch.save(ckpt, scene.model_path + "/chkpnt_face_latest" + ".pth")
 
 
 
@@ -452,7 +335,7 @@ def prepare_output_and_logger(args):
         print("Tensorboard not available: not logging progress")
     return tb_writer
 
-def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_iterations, scene : Scene, motion_net, renderFunc, renderArgs, pose_runtime=None, pose_start_iter=0):
+def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_iterations, scene : Scene, motion_net, renderFunc, renderArgs):
     if tb_writer:
         tb_writer.add_scalar('train_loss_patches/l1_loss', Ll1.item(), iteration)
         tb_writer.add_scalar('train_loss_patches/total_loss', loss.item(), iteration)
@@ -472,13 +355,10 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_i
                     if viewpoint.original_image == None:
                         viewpoint = loadCamOnTheFly(copy.deepcopy(viewpoint))
                         
-                    refined_pose = None
-                    if pose_runtime and iteration >= pose_start_iter:
-                        refined_pose = pose_runtime.pose(viewpoint, "test" if config['name'] == 'test' else "train", detach=True)
                     if renderFunc is render:
-                        render_pkg = renderFunc(viewpoint, scene.gaussians, *renderArgs, refined_pose=refined_pose)
+                        render_pkg = renderFunc(viewpoint, scene.gaussians, *renderArgs)
                     else:
-                        render_pkg = renderFunc(viewpoint, scene.gaussians, motion_net, return_attn=True, frame_idx=0, *renderArgs, refined_pose=refined_pose)
+                        render_pkg = renderFunc(viewpoint, scene.gaussians, motion_net, return_attn=True, frame_idx=0, *renderArgs)
 
                     image = torch.clamp(render_pkg["render"], 0.0, 1.0)
                     alpha = render_pkg["alpha"]

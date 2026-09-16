@@ -79,9 +79,6 @@ class Camera(nn.Module):
         self.projection_matrix = projection_matrix.to(matrix_device)
         self.full_proj_transform = full_proj_transform.to(matrix_device)
         self.camera_center = camera_center.to(matrix_device)
-        # Immutable LPHS/3DMM initialization used by the optional pose refiner.
-        self.coarse_world_view_transform = self.world_view_transform
-        self.coarse_camera_center = self.camera_center
 
 class MiniCam:
     def __init__(self, width, height, fovy, fovx, znear, zfar, world_view_transform, full_proj_transform):

@@ -412,6 +412,45 @@ def stabilize_head(
     print(f'[INFO] ===== finished LPHS head stabilization =====')
 
 
+def align_canonical_head(
+    base_dir,
+    canonical_python,
+    densemarks_repo,
+    densemarks_weights,
+    template_mode='expression_invariant',
+    feature_size=512,
+    batch_size=4,
+    overwrite=False,
+    keep_cache=False,
+    rebuild_cache=False,
+):
+    print(f'[INFO] ===== run direct canonical head alignment =====')
+    if not canonical_python or not densemarks_repo or not densemarks_weights:
+        raise RuntimeError(
+            'Canonical alignment requires --canonical_python, '
+            '--densemarks_repo, and --densemarks_weights'
+        )
+    cmd = [
+        sys.executable,
+        'data_utils/align_canonical.py',
+        '--data', base_dir,
+        '--canonical_python', canonical_python,
+        '--densemarks_repo', densemarks_repo,
+        '--densemarks_weights', densemarks_weights,
+        '--template_mode', template_mode,
+        '--feature_size', str(feature_size),
+        '--batch_size', str(batch_size),
+    ]
+    if overwrite:
+        cmd.append('--overwrite')
+    if keep_cache:
+        cmd.append('--keep_cache')
+    if rebuild_cache:
+        cmd.append('--rebuild_cache')
+    run_command(cmd)
+    print(f'[INFO] ===== finished direct canonical head alignment =====')
+
+
 def save_transforms(base_dir, ori_imgs_dir, track_params='track_params.pt'):
     print(f'[INFO] ===== save transforms =====')
 
@@ -517,7 +556,7 @@ if __name__ == '__main__':
     parser.add_argument('--task', type=int, default=-1, help="-1 means all")
     parser.add_argument('--asr', type=str, default='deepspeech', help="wav2vec or deepspeech")
     parser.add_argument(
-        '--head_stabilizer', choices=['none', 'lphs'], default='none',
+        '--head_stabilizer', choices=['none', 'lphs', 'canonical'], default='none',
         help='optional offline head-pose stabilizer',
     )
     parser.add_argument(
@@ -532,6 +571,19 @@ if __name__ == '__main__':
         '--lphs_overwrite', action='store_true',
         help='replace an existing track_params_lphs.pt',
     )
+    parser.add_argument('--canonical_python', type=str, default=None)
+    parser.add_argument('--densemarks_repo', type=str, default=None)
+    parser.add_argument('--densemarks_weights', type=str, default=None)
+    parser.add_argument(
+        '--canonical_template_mode',
+        choices=['universal', 'identity', 'expression_invariant'],
+        default='expression_invariant',
+    )
+    parser.add_argument('--canonical_feature_size', type=int, default=512)
+    parser.add_argument('--canonical_batch_size', type=int, default=4)
+    parser.add_argument('--canonical_overwrite', action='store_true')
+    parser.add_argument('--canonical_keep_cache', action='store_true')
+    parser.add_argument('--canonical_rebuild_cache', action='store_true')
     parser.add_argument(
         '--track_params', type=str, default=None,
         help='parameter file used by task 9; defaults to track_params.pt',
@@ -603,6 +655,20 @@ if __name__ == '__main__':
                 overwrite=opt.lphs_overwrite,
             )
 
+        if opt.task == 11 or (opt.task == -1 and opt.head_stabilizer == 'canonical'):
+            align_canonical_head(
+                base_dir,
+                canonical_python=opt.canonical_python,
+                densemarks_repo=opt.densemarks_repo,
+                densemarks_weights=opt.densemarks_weights,
+                template_mode=opt.canonical_template_mode,
+                feature_size=opt.canonical_feature_size,
+                batch_size=opt.canonical_batch_size,
+                overwrite=opt.canonical_overwrite,
+                keep_cache=opt.canonical_keep_cache,
+                rebuild_cache=opt.canonical_rebuild_cache,
+            )
+
         # save transforms.json
         if opt.task == -1 or opt.task == 9:
             track_params = opt.track_params
@@ -610,7 +676,11 @@ if __name__ == '__main__':
                 track_params = (
                     'track_params_lphs.pt'
                     if opt.head_stabilizer == 'lphs'
-                    else 'track_params.pt'
+                    else (
+                        'track_params_canonical.pt'
+                        if opt.head_stabilizer == 'canonical'
+                        else 'track_params.pt'
+                    )
                 )
             save_transforms(base_dir, ori_imgs_dir, track_params=track_params)
     except (RuntimeError, subprocess.CalledProcessError) as e:
