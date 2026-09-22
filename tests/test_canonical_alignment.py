@@ -15,6 +15,9 @@ from data_utils.canonical_alignment.aligner import (
     _optimize_frames,
     _project,
     _sample_map,
+    _smoothstep,
+    _spatial_extent,
+    _temporal_refine_deltas,
 )
 
 
@@ -65,6 +68,42 @@ class CanonicalTemplateTest(unittest.TestCase):
 
 
 class CanonicalOptimizationTest(unittest.TestCase):
+    def test_temporal_refinement_reduces_an_isolated_pose_spike(self):
+        nine = 9
+        deltas = torch.zeros(nine, 6)
+        deltas[nine // 2, 0] = 0.12
+        confidence = torch.ones(nine)
+        config = CanonicalAlignmentConfig(
+            temporal_optimization_steps=150,
+            temporal_learning_rate=0.03,
+        )
+        refined = _temporal_refine_deltas(
+            deltas, confidence, 0.2, torch.tensor(0.2), config
+        )
+        original_acceleration = (deltas[2:] - 2 * deltas[1:-1] + deltas[:-2]).square().mean()
+        refined_acceleration = (refined[2:] - 2 * refined[1:-1] + refined[:-2]).square().mean()
+        self.assertLess(float(refined_acceleration), float(original_acceleration))
+        self.assertGreater(float(refined[nine // 2, 0]), 0.0)
+        self.assertLess(float(refined[nine // 2, 0]), 0.12)
+
+    def test_reliability_scores_are_continuous_and_check_spatial_coverage(self):
+        values = torch.tensor([-1.0, 0.0, 0.5, 1.0, 2.0])
+        scores = _smoothstep(values, 0.0, 1.0)
+        self.assertTrue(torch.all(scores[1:] >= scores[:-1]))
+        self.assertEqual(float(scores[0]), 0.0)
+        self.assertEqual(float(scores[-1]), 1.0)
+        distributed = torch.tensor([[
+            [10.0, 10.0], [90.0, 10.0], [10.0, 90.0], [90.0, 90.0],
+        ]])
+        concentrated = torch.tensor([[
+            [49.0, 49.0], [51.0, 49.0], [49.0, 51.0], [51.0, 51.0],
+        ]])
+        active = torch.ones(1, 4)
+        self.assertGreater(
+            float(_spatial_extent(distributed, active, 100, 100)),
+            float(_spatial_extent(concentrated, active, 100, 100)),
+        )
+
     def test_per_frame_alignment_reduces_direct_canonical_error(self):
         size = 128
         yy, xx = torch.meshgrid(
@@ -102,6 +141,7 @@ class CanonicalOptimizationTest(unittest.TestCase):
             focal, center, size, size, config, torch.device("cpu"),
         )
         self.assertTrue(diagnostics[0]["accepted"])
+        self.assertGreater(diagnostics[0]["confidence"], 0.5)
         self.assertGreater(diagnostics[0]["improvement"], 0.5)
         self.assertLess(float(torch.linalg.norm(translation - true_translation)), 0.03)
 

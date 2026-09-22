@@ -118,8 +118,11 @@ def main():
     )
     print("Canonical parameters saved to %s" % output)
     print(
-        "Accepted frames: %d/%d"
-        % (diagnostics["accepted_frames"], diagnostics["frames"])
+        "High-confidence frames: %d/%d; applied: %d; mean confidence: %.3f"
+        % (
+            diagnostics["accepted_frames"], diagnostics["frames"],
+            diagnostics["applied_frames"], diagnostics["mean_confidence"],
+        )
     )
     if not args.keep_cache:
         shutil.rmtree(cache_dir)

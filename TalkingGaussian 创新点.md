@@ -15,15 +15,14 @@
    `8×8`、`16×16`、`32×32` 三尺度调制图，并根据每个 Gaussian 的静态空间特征和
    canonical scale 自适应混合调制尺度。二者共同构成一个完整的 Face branch 条件调制方法。
 
-2. **Large-Pose-Aware Head Stabilizer（LPHS）**
+2. **Canonical Feature Head Stabilizer（CFHS）**
 
-   在 3DMM 粗跟踪之后、生成 `transforms_train.json` 和 `transforms_val.json` 之前，利用
-   姿态相关可见性、双向光流可靠性、关键帧重锚定和自适应 SE(3) 时序优化修正相机姿态。
+   在 3DMM 粗跟踪之后、生成 `transforms_train.json` 和 `transforms_val.json` 之前，从可靠训练帧建立人物专属 canonical 特征模板，让每帧直接对齐同一模板，并通过连续置信度与全序列 SE(3) 时间约束修正相机姿态。
 
 后文使用 `QGSFM` 表示完整的“查询引导尺度感知人脸调制”，使用 `SQAF` 和 `GSAM` 指代其中
-的条件融合与尺度路由子模块；`LPHS` 表示“大姿态感知头部稳定器”。
+的条件融合与尺度路由子模块；`CFHS` 表示“Canonical 特征头部稳定器”。
 
-第一个创新点 QGSFM 参与 Face motion network 的训练和推理；第二个创新点 LPHS 属于数据
+第一个创新点 QGSFM 参与 Face motion network 的训练和推理；第二个创新点 CFHS 属于数据
 预处理，只离线生成更稳定的相机外参，不作为训练时的额外神经网络。
 
 ### 整体流程图
@@ -31,7 +30,7 @@
 ```text
                          Offline data preprocessing
 ┌───────────────────────────────────────────────────────────────────────────┐
-│ Reference video → landmarks + 3DMM coarse tracking → LPHS                │
+│ Reference video → 3DMM coarse tracking → CFHS canonical alignment       │
 │                                                        │                  │
 │                                                        ▼                  │
 │                                      refined camera poses R*, T*          │
@@ -412,209 +411,308 @@ bash scripts/train_xx.sh data/<ID> output/<run_name> <GPU_ID> 0
 
 ---
 
-## 13. 创新点二：Large-Pose-Aware Head Stabilizer（LPHS）
+## 13. 创新点二：Canonical Feature Head Stabilizer（CFHS）
 
-### 13.1 模块位置和目标
+### 13.1 它要解决什么问题
 
-TalkingGaussian 需要先用 3DMM 将视频帧转换为 canonical Gaussian field 对应的相机姿态。
-当 yaw 较大时，一侧面部会发生自遮挡，普通 landmark 或逐帧 optical flow 可能漂移，导致错误的
-`R_t, T_t` 被写入 transforms 文件。由于所有 Gaussian 共享该相机变换，姿态误差表现为整个头部
-抖动，而不只是局部嘴部误差。
+TalkingGaussian 先通过 3DMM tracking 得到每帧头部姿态，再把姿态写入
+`transforms_train.json` 和 `transforms_val.json`。训练时，Face 和 Mouth 两组 Gaussian 都使用这套相机变换。如果某一帧的旋转或平移有一点误差，渲染结果就会表现为整个头部突然移动；网络
+还可能把相机误差错误地学习成面部形变。
 
-LPHS 插入在粗 3DMM tracking 和 transforms 生成之间：
+这个问题在大角度转头时尤其明显：一侧脸被遮挡、轮廓点的语义发生变化、嘴眼区域又受到表情
+影响，逐帧 3DMM tracking 很容易产生小幅跳变。
+
+CFHS 的核心思路可以概括为：
+
+> 先从同一个人的可靠帧中建立一个统一头部特征模板，再让每一帧直接寻找自己在该模板中的
+> 位置，最后对整段姿态修正施加时间约束。
+
+它位于粗 3DMM tracking 与 transforms 生成之间：
 
 ```text
-ori_imgs + landmarks + landmark confidence + track_params.pt
-                               │
-                               ▼
-                              LPHS
-                               │
-                               ▼
-                    track_params_lphs.pt
-                               │
-                               ▼
-              transforms_train.json / transforms_val.json
+ori_imgs + parsing + landmark confidence + track_params.pt
+                              │
+                              ▼
+            DenseMarks canonical feature extraction
+                              │
+                              ▼
+          identity-specific canonical feature template
+                              │
+                              ▼
+       per-frame SE(3) direct alignment + confidence fusion
+                              │
+                              ▼
+              full-sequence temporal refinement
+                              │
+                              ▼
+                  track_params_canonical.pt
+                              │
+                              ▼
+          transforms_train.json / transforms_val.json
 ```
 
-LPHS 固定每帧的 3DMM identity/expression geometry，只优化粗姿态上的 SE(3) 增量，不联合修改
-3DMM 几何，也不改变音频特征或 Face/Mouth Gaussian 参数。
+CFHS 固定 3DMM identity 和 expression geometry，只修正每帧粗姿态上的 6 维 SE(3) 增量。它
+不改变音频、AU、Gaussian 初始化或 Face/Mouth motion network，也不是训练期间额外运行的网络。
 
-### 13.2 Pose-Aware Visibility
+### 13.2 第一步：提取逐帧 Canonical 特征
 
-LPHS 使用 68 个 3D landmark anchors 和 464 个 rigid mesh anchors，共 532 个 anchor。粗 3DMM
-几何经过当前姿态变换后，使用表面朝向分数和 z-buffer 可见性得到：
+对每一帧原始图像，DenseMarks 输出：
 
 ```text
-visibility_weight = front_facing_score × z_buffer_visibility
+uvw feature: [3,Hf,Wf]
+head mask:   [Hf,Wf]
 ```
 
-大 yaw 下背向相机或被面部表面遮挡的 anchor 权重接近 0，避免不可见一侧的错误观测拉动全局姿态。
-为降低显存和计算开销，可见性渲染按照 `visibility_batch_size` 分批，并可通过
-`visibility_max_side` 使用缩放后的图像尺寸。
+这里的 `uvw` 不是 RGB 颜色，而是与统一头部表面对应的 canonical embedding。直观理解是：
+同一人的鼻梁位置即使在不同帧、不同角度下出现在不同像素处，理想情况下仍应具有相近的
+canonical 特征。
 
-### 13.3 双向光流与关键帧重锚定
+提取结果保存在 `canonical_features/` 中。manifest 会记录图像哈希、特征尺寸、模型权重哈希和
+帧顺序；图像被修改、帧数不一致或权重不匹配时会明确报错，防止错误复用旧缓存。
 
-相邻帧计算正向和反向光流，并执行 forward-backward consistency：
+### 13.3 第二步：选择可靠帧并建立人物模板
+
+模板不能由任意单帧直接复制，因为单帧可能包含闭眼、张嘴、自遮挡或 tracking 误差。系统先用
+粗 3DMM 姿态和几何计算每个表面 anchor 的朝向与 z-buffer 可见性，再综合以下指标选择模板帧：
+
+- landmark detector confidence；
+- 3DMM landmark 重投影误差；
+- 刚性头部区域的可见比例；
+- yaw 分箱，保证模板包含不同观察角度；
+- 每个 yaw 区间的候选帧数量上限，避免正脸帧淹没侧脸帧。
+
+默认只从训练区间，即完整序列前 `10/11` 中选择模板帧，避免读取验证帧建立模板。最多使用
+128 个可靠帧。
+
+对同一 3DMM 刚性表面点，在所有可靠帧的投影位置采样 DenseMarks 特征，然后聚合为人物专属
+模板：
 
 ```text
-p_t ── forward flow ──→ p_(t+1)
- ▲                         │
- └──── backward flow ──────┘
+3D surface point X_i
+       │ project with coarse R_t,T_t
+       ▼
+image position p_(i,t)
+       │ sample DenseMarks
+       ▼
+canonical observation f_(i,t)
+       │ robust multi-frame aggregation
+       ▼
+template feature f_bar_i
 ```
 
-往返误差越大，`flow_confidence` 越低。为避免长视频中的顺序累计漂移，系统根据粗 yaw 进行分箱，
-从不同姿态区间选择高置信度关键帧。当满足以下条件之一时执行 keyframe re-anchoring：
+默认的 `expression_invariant` 模式还会对 3DMM expression 参数做 PCA，并用岭回归分离与表情
+相关的特征变化。回归截距作为中性模板特征，因此张嘴或眨眼不会被简单写进身份模板。每个
+anchor 还会根据跨帧重复性、观测覆盖率和 yaw 覆盖率得到模板可靠性权重。
 
-- 到达固定 `reanchor_interval`；
-- 当前帧进入新的 yaw bin；
-- 相邻帧跟踪的中位置信度低于阈值。
+### 13.4 第三步：每帧直接对齐模板
 
-顺序跟踪结果和关键帧匹配结果根据各自置信度加权融合。默认优先使用 RAFT；RAFT 不可用时可
-回退到 DIS optical flow。
-
-### 13.4 动态可靠性权重
-
-LPHS 对每个 anchor、每一帧构造动态权重：
+对第 `t` 帧，以粗姿态 `(R_t^0,T_t^0)` 为起点，只优化一个 6 维修正：
 
 ```text
-w(i,t) = w_sem(i)
-       × w_vis(i,t)
-       × w_flow(i,t)
-       × w_conf(i,t)
+delta_xi_t = [rotation correction, translation correction]
+
+(R_t*,T_t*) = compose_increment(delta_xi_t, R_t^0,T_t^0)
+```
+
+修正后的姿态把刚性 3D anchor 投影到当前帧，在投影点采样当前 DenseMarks 特征，并与模板中同一
+表面位置的特征比较：
+
+```text
+L_align(t) = sum_i w_(i,t) ||F_t(project(T_t* X_i)) - f_bar_i||
+             / sum_i w_(i,t)
+```
+
+`w_(i,t)` 同时包含模板可靠性、当前姿态可见性、head mask 和图像边界检查。这样，大 yaw 下被
+遮挡的一侧不会参与对齐。优化还包含 pose prior，并限制最大旋转和平移修正，避免特征歧义把
+姿态拉到不合理位置。
+
+这一过程与相邻光流跟踪的关键区别是：每一帧都直接对齐同一个模板。某段侧脸发生遮挡后，人物
+重新转回正脸时仍然对齐原模板，不依赖遮挡期间累计下来的轨迹。
+
+### 13.5 连续置信度：避免逐帧硬切换
+
+早期实现采用“通过检查就全部使用修正，否则完全退回粗姿态”的硬切换。若相邻两帧刚好落在
+阈值两侧，姿态会突然跳变。当前实现为每帧计算 `0～1` 的连续置信度：
+
+```text
+c_t = geometric_mean(
+    anchor confidence,
+    improvement confidence,
+    coverage confidence,
+    spatial confidence,
+    bound confidence
+)
+
+delta_xi_t_applied = c_t × delta_xi_t
+```
+
+五个组成部分分别检查：
+
+1. **Anchor 数量**：当前帧是否有足够多可靠表面点；
+2. **损失改善**：优化后 canonical 特征误差是否真的下降；
+3. **覆盖保留率**：优化后仍在 mask 和图像范围内的 anchor 是否大量丢失；
+4. **空间分布**：anchor 是否同时覆盖二维头部区域，而不是集中在一个很小的局部；
+5. **边界余量**：修正是否贴近最大旋转或最大平移限制。
+
+置信度高时保留大部分直接对齐结果；证据较弱时只应用较小修正；检查完全失败时自然回到粗
+3DMM 姿态。这里通过缩放 SE(3) twist 实现连续插值，而不是在两个姿态矩阵之间逐元素平均。
+
+### 13.6 全序列 SE(3) 时间约束
+
+连续置信度消除了硬切换，但逐帧特征本身仍可能存在轻微噪声。因此系统在所有批次完成后，对
+整段修正序列统一执行时间优化，而不是只在每个 32 帧 batch 内平滑：
+
+```text
+L_temporal = L_data
+           + lambda_c × L_coarse
+           + lambda_v × L_velocity
+           + lambda_a × L_acceleration
 ```
 
 其中：
 
-- `w_sem`：语义刚性权重。nose bridge 等刚性区域权重高；face contour 中等；眼睛、眉毛、
-  嘴部等表情区域权重低；
-- `w_vis`：当前姿态下的朝向与 z-buffer 可见性；
-- `w_flow`：双向光流一致性和重锚定可靠性；
-- `w_conf`：landmark detector confidence 或传播后的 source confidence。
-
-若某帧有效 anchor 数量低于 `min_effective_anchors`，该帧的观测权重会被置零，主要依靠相邻帧
-的时序项和 pose prior 约束，避免少数异常点控制姿态。
-
-### 13.5 Robust SE(3) Temporal Optimization
-
-对粗姿态 `R_t, T_t` 引入 6 维 Lie algebra 增量 `delta_t`：
-
 ```text
-(R*_t, T*_t) = compose_increment(delta_t, R_t, T_t)
+L_data         = ||delta'_t - delta_t_applied||²
+L_coarse       = (1-c_t) ||delta'_t||²
+L_velocity     = ||delta'_t - delta'_(t-1)||²
+L_acceleration = ||delta'_(t+1)-2delta'_t+delta'_(t-1)||²
 ```
 
-优化目标由三部分组成：
+- `L_data` 保留每帧 canonical 对齐提供的观测；
+- `L_coarse` 让低置信度帧更靠近原始粗姿态；
+- `L_velocity` 抑制相邻修正突然变化；
+- `L_acceleration` 抑制单帧尖峰和高频摆动。
+
+旋转和平移先分别用允许的最大修正幅度归一化，避免单位不同导致某一项主导优化。当前默认权重
+为 `lambda_v=0.15`、`lambda_a=0.05`、`lambda_c=0.10`，优化 100 步。时间项作用于“附加的
+姿态修正”，因此原始 3DMM 轨迹中的真实快速转头仍被保留。
+
+### 13.7 两轮模板更新
+
+完整对齐执行两轮：
 
 ```text
-L_LPHS = L_detector_reprojection
-       + lambda_track × L_track_reprojection
-       + lambda_acc × L_adaptive_acceleration
-       + lambda_prior × L_pose_prior
+coarse pose → initial template → first alignment
+                              │
+                              ▼
+               select high-confidence template frames
+                              │
+                              ▼
+           rebuild visibility and canonical template
+                              │
+                              ▼
+                 second alignment + temporal refinement
 ```
 
-重投影项使用 Huber loss，并由上一节的动态可靠性权重控制。时序项作用于相邻相对姿态 twist
-的二阶差分，即姿态加速度，而不是直接对绝对 yaw/pitch/roll 做平滑：
+第一轮改善模板帧的姿态；第二轮使用高置信度结果重新计算可见性和模板，再从原始粗姿态出发得到
+最终修正。若高置信度模板帧不足，则安全回退到第一轮选择的可靠帧集合。
+
+### 13.8 完整流程图
 
 ```text
-relative motion: xi_t = log(T_t * inverse(T_(t-1)))
-acceleration:    a_t  = xi_t - xi_(t-1)
+Reference frames                            Coarse 3DMM
+      │                                geometry, expression, R0,T0
+      ▼                                           │
+DenseMarks uvw + head mask                        ▼
+      │                                surface anchors + visibility
+      │                                           │
+      └───────────────┬───────────────────────────┘
+                      ▼
+       reliable training-frame selection by
+   confidence + reprojection + visibility + yaw bins
+                      │
+                      ▼
+      multi-view expression-invariant identity template
+                      │
+                      ▼
+       each frame directly aligns to the same template
+                      │
+                      ▼
+ anchor count + loss improvement + retained coverage
+       + spatial extent + correction-bound margin
+                      │
+                      ▼
+          continuous confidence c_t in [0,1]
+                      │
+                      ▼
+             c_t × per-frame SE(3) correction
+                      │
+                      ▼
+ full-sequence velocity + acceleration refinement
+                      │
+                      ▼
+                refined R*_t,T*_t
+                      │
+                      ▼
+             track_params_canonical.pt
+                      │
+                      ▼
+        transforms_train.json / transforms_val.json
+                      │
+                      ▼
+ shared camera input for Face and Mouth Gaussian rendering
 ```
 
-加速度权重根据粗姿态运动量自适应：静止或缓慢运动时加强抖动抑制，快速真实转头时减弱时序
-约束。`pose prior` 则限制优化结果不要无依据地远离粗 3DMM 姿态。代码还限制单帧增量的旋转
-和位移幅度，以降低异常优化风险。
+### 13.9 输出与诊断文件
 
-### 13.6 LPHS 完整流程图
+CFHS 生成：
 
 ```text
-Reference frames                         Coarse 3DMM parameters
-      │                                  geometry, R_t, T_t
-      ├───────────────┐                         │
-      │               │                         ▼
-      │               │               3D anchor construction
-      │               │                         │
-      ▼               ▼                         ▼
-68 landmarks     Bidirectional flow    normals + z-buffer visibility
-      │               │                         │
-      │         keyframe re-anchor              │
-      │               │                         │
-      ▼               ▼                         ▼
-detector conf.   flow confidence          visibility weight
-      │               │                         │
-      └───────────────┼─────────────────────────┘
-                      │
-                      ▼
-            semantic × visibility × flow × confidence
-                      │
-                      ▼
-              dynamic anchor reliability
-                      │
-                      ▼
-       weighted Huber reprojection + pose prior
-                      +
-          adaptive SE(3) acceleration constraint
-                      │
-                      ▼
-                 optimized R*_t, T*_t
-                      │
-                      ▼
-              track_params_lphs.pt
-                      │
-                      ▼
-         transforms_train.json / transforms_val.json
-                      │
-                      ▼
-        shared camera input for Face and Mouth rendering
+canonical_features/
+canonical_template.npz
+canonical_diagnostics.json
+track_params_canonical.pt
+transforms_train.json
+transforms_val.json
 ```
 
-### 13.7 输出文件
+- `canonical_features/`：逐帧 DenseMarks 特征、head mask 和校验 manifest；
+- `canonical_template.npz`：模板特征、anchor 可靠性、模板帧和 yaw 分箱；
+- `track_params_canonical.pt`：保留原 3DMM 参数，并保存最终 `rot`、`trans` 和 `euler`；
+- `canonical_diagnostics.json`：记录每帧置信度及其五个分量、优化前后损失、原始与应用后的修正、
+  时间调整量、重投影误差和旋转速度/加速度；
+- transforms 文件：TalkingGaussian 训练和渲染实际读取的相机外参。
 
-LPHS 会在数据目录生成：
+诊断中的 `accepted` 仅表示 `confidence >= 0.5` 的高置信度统计，不再控制全量采用或完全回退。
+判断方法是否有效时，应同时查看渲染视频、旋转加速度、LVD、tLPIPS、tOF 和 Flow Warp Error；
+不能只凭 canonical 特征损失下降就断言最终视频一定更稳定。
 
-```text
-track_params_lphs.pt
-lphs_observations.npz
-lphs_diagnostics.json
-```
+### 13.10 新视频的数据处理方式
 
-- `track_params_lphs.pt`：保留原始 3DMM 参数，并使用优化后的 `rot`、`trans` 和 `euler`；
-- `lphs_observations.npz`：保存光流轨迹、landmark、语义/可见性/光流/置信度权重和关键帧，便于
-  可视化或排查；
-- `lphs_diagnostics.json`：保存优化配置、使用的 flow backend、关键帧、弱观测帧以及优化前后
-  的重投影和姿态时序诊断值。
-
-诊断值用于判断优化过程是否按预期工作，不应在没有实验统计的情况下直接宣称 LPHS 一定提升
-所有视频的稳定性。
-
-### 13.8 新视频的数据处理方式
-
-对新视频执行完整预处理并启用 LPHS：
+完整预处理并启用 CFHS：
 
 ```bash
 python data_utils/process.py data/<ID>/<ID>.mp4 \
-    --head_stabilizer lphs \
-    --lphs_preset balanced \
-    --lphs_flow_backend raft
+    --head_stabilizer canonical \
+    --canonical_python /path/to/python>=3.10 \
+    --densemarks_repo /path/to/densemarks \
+    --densemarks_weights /path/to/model.safetensors \
+    --canonical_keep_cache
 ```
 
-如果基础预处理已经完成，只执行 LPHS：
+基础预处理已经完成时，只执行 canonical 对齐：
 
 ```bash
 python data_utils/process.py data/<ID>/<ID>.mp4 \
-    --task 10 \
-    --lphs_preset balanced \
-    --lphs_flow_backend raft
+    --task 11 \
+    --canonical_python /path/to/python>=3.10 \
+    --densemarks_repo /path/to/densemarks \
+    --densemarks_weights /path/to/model.safetensors \
+    --canonical_keep_cache \
+    --canonical_overwrite
 ```
 
-然后使用 LPHS 参数重新生成 transforms：
+然后同步刷新 transforms：
 
 ```bash
 python data_utils/process.py data/<ID>/<ID>.mp4 \
     --task 9 \
-    --track_params track_params_lphs.pt
+    --track_params track_params_canonical.pt
 ```
 
-若目标文件已经存在并且确定需要覆盖，显式增加 `--lphs_overwrite`。LPHS 的几何可见性步骤与
-项目原始 3DMM tracker 一样依赖 CUDA。
+`--canonical_keep_cache` 会保留特征，后续调整置信度或时间约束时无需再次运行 DenseMarks。
+DenseMarks 提取环境要求 Python 3.10 或更高；几何可见性和对齐阶段使用 TalkingGaussian 环境并
+依赖 CUDA。
 
 ---
 
@@ -625,10 +723,10 @@ python data_utils/process.py data/<ID>/<ID>.mp4 \
 | 模块 | 所处阶段 | 主要输入 | 主要输出 | 解决的问题 |
 | --- | --- | --- | --- | --- |
 | QGSFM（由 SQAF 与 GSAM 组成） | Face branch 训练与推理 | audio、AU、learned plane query、Gaussian XYZ 和 base scale | 空间门控融合、多尺度调制与 Gaussian deformation | 异构条件缺少空间分工，且固定调制分辨率与 Gaussian 尺度不匹配 |
-| LPHS | 离线数据预处理 | 视频帧、landmark、粗 3DMM 姿态和几何 | 稳定的相机 `R*, T*` 与 transforms 文件 | 大姿态、自遮挡和跟踪漂移造成的全头抖动 |
+| CFHS | 离线数据预处理 | 视频帧、DenseMarks、粗 3DMM 姿态和几何 | 稳定的相机 `R*, T*` 与 transforms 文件 | 大姿态、自遮挡和逐帧对齐噪声造成的全头抖动 |
 
 它们最终在渲染阶段汇合：QGSFM 内部先由 SQAF 将音频与 AU 映射为空间调制特征，再由 GSAM
-依据 Gaussian 的空间表征和 canonical scale 选择调制分辨率；LPHS 提供稳定的共享 camera
+依据 Gaussian 的空间表征和 canonical scale 选择调制分辨率；CFHS 提供稳定的共享 camera
 transform。原始 Mouth branch 继续预测口腔内部位置形变。这样形成“稳定全局坐标 + 尺度适配
 局部形变”的两级方法。
 
@@ -639,7 +737,7 @@ transform。原始 Mouth branch 继续预测口腔内部位置形变。这样形
 ### 15.1 建议的核心问题
 
 论文不宜把问题简单写成“TalkingGaussian 的调制图分辨率不够”或“我们增加若干模块”。这种表述
-容易被审稿人理解为局部工程改动，而且 LPHS 与 Face branch 看起来缺少联系。
+容易被审稿人理解为局部工程改动，而且 CFHS 与 Face branch 看起来缺少联系。
 
 更合适的核心问题是：
 
@@ -673,11 +771,11 @@ Reliable and Scale-Aligned Gaussian Motion Learning
                          ▼
            In which coordinate system?
                          │
-                LPHS pose stabilization
+                CFHS canonical stabilization
 ```
 
 两个创新点覆盖三个相互关联的层次：QGSFM 联合处理 **condition alignment** 和
-**scale alignment**，LPHS 处理 **coordinate reliability**。
+**scale alignment**，CFHS 处理 **coordinate reliability**。
 
 ### 15.2 论文故事的逻辑顺序
 
@@ -724,23 +822,24 @@ mix suitable modulation resolutions”，不要在没有可视化证据时直接
 
 #### 第四段：不稳定相机坐标会污染局部形变学习
 
-前两个模块都依赖 canonical Gaussian 坐标和每帧相机姿态。当大 yaw 导致自遮挡时，不可见
-landmark 和漂移的 optical flow 会污染粗 3DMM pose。相机误差会被训练过程吸收到 Gaussian
-deformation 中，使网络用局部非刚性形变补偿全局刚性误差，并在渲染中表现为整体头部抖动。
+前两个模块都依赖 canonical Gaussian 坐标和每帧相机姿态。当大 yaw 导致自遮挡时，可用
+landmark 变少，轮廓点的像素位置与真实表面位置也更难稳定对应，容易污染粗 3DMM pose。相机
+误差会被训练过程吸收到 Gaussian deformation 中，使网络用局部非刚性形变补偿全局刚性误差，
+并在渲染中表现为整体头部抖动。
 
 由此提出第三个观察：
 
 > Scale-aware local motion remains ill-posed when the global camera coordinate is temporally unreliable.
 
-第二个创新点 LPHS 在训练前估计 pose-dependent visibility 和 tracking reliability，通过 weighted
-robust reprojection 与 adaptive SE(3) temporal optimization 得到稳定相机外参。
+第二个创新点 CFHS 在训练前建立人物专属 canonical 特征模板，使每帧直接对齐同一模板，
+再用连续可靠性融合和全序列 SE(3) 时间约束得到稳定相机外参。
 
 #### 第五段：方法闭环
 
 最终方法形成以下闭环：
 
 ```text
-LPHS stabilizes the coordinate system
+CFHS stabilizes the coordinate system
                 │
                 ▼
 SQAF aligns audio/AU with spatial regions
@@ -763,24 +862,24 @@ deformation MLP predicts local face motion in the refined coordinate system
    conditions, and then constructs a shared multi-resolution modulation pyramid with a Gaussian-level
    router conditioned on static spatial features and canonical Gaussian scales. This enables each facial
    Gaussian to receive source-aware and scale-adaptive modulation before FiLM-based deformation.
-2. **Large-Pose-Aware Head Stabilizer (LPHS).** We develop an offline pose refinement method that combines
-   pose-dependent visibility, bidirectional-flow reliability, semantic confidence, keyframe re-anchoring,
-   and adaptive SE(3) temporal optimization to provide stable camera transforms under large head poses.
+2. **Canonical Feature Head Stabilizer (CFHS).** We build an expression-insensitive identity template from
+   reliable multi-view canonical features, directly align every frame to this shared template, and combine
+   continuous alignment confidence with full-sequence SE(3) temporal refinement for stable camera transforms.
 
 中文表述可以写成：
 
 1. 提出查询引导尺度感知人脸调制方法（QGSFM）：首先基于可学习三平面 query 对音频和 AU
    条件进行逐位置门控融合，再通过共享多分辨率调制金字塔和 Gaussian 级路由器，为不同空间
    位置与尺度的 Gaussian 自适应混合调制分辨率；
-2. 提出大姿态感知头部稳定器（LPHS），联合利用姿态可见性、双向光流可靠性、关键帧重锚定和
-   自适应 SE(3) 时序约束，生成稳定的训练与渲染相机轨迹。
+2. 提出 Canonical 特征头部稳定器（CFHS）：从可靠多视角观测构建表情不敏感的人物模板，
+   将每帧直接对齐共享模板，并结合连续置信度与全序列 SE(3) 时间约束生成稳定相机轨迹。
 
 ### 15.4 摘要中的一句话方法概括
 
 可以使用下面这句作为摘要方法部分的基础：
 
 > We present a reliable and scale-aligned Gaussian motion framework that first stabilizes large-pose
-> camera trajectories with LPHS, then spatially fuses audio and AU conditions through SQAF, and finally
+> camera trajectories with CFHS, then spatially fuses audio and AU conditions through SQAF, and finally
 > uses GSAM to route each facial Gaussian to a learned mixture of multi-resolution modulation fields.
 
 对应中文：
@@ -794,7 +893,7 @@ deformation MLP predicts local face motion in the refined coordinate system
 如果实验结果同时证明局部质量和大姿态稳定性，可以考虑：
 
 - **Reliable and Scale-Aligned Gaussian Motion Fields for Talking Head Synthesis**
-- **ScaleTalkGaussian: Scale-Aligned Motion Fields with Large-Pose Stabilization**
+- **ScaleTalkGaussian: Scale-Aligned Motion Fields with Canonical Pose Stabilization**
 - **Stable Gaussian Talking Heads via Query-Guided Modulation and Scale-Aware Routing**
 
 第一种最稳妥，能够覆盖两个创新点且不把论文标题绑定在某一个实现细节上。第二种更强调方法名称，
@@ -806,8 +905,10 @@ deformation MLP predicts local face motion in the refined coordinate system
   没有区域语义标签；
 - 不要声称 router 必然建立“大 Gaussian→低分辨率、小 Gaussian→高分辨率”的单调映射。当前
   router 同时读取空间特征和尺度描述符，输出是学习到的混合权重；
-- 不要把 LPHS 描述成 jointly optimizing 3D geometry and pose。当前实现固定 3DMM geometry，
-  优化每帧姿态的 SE(3) 增量；
+- 不要把 CFHS 描述成 jointly optimizing 3D geometry and pose。当前实现固定 3DMM geometry，
+  优化每帧姿态的 SE(3) 增量，并在整段修正序列上施加时间约束；
+- 不要把 DenseMarks 本身描述为本文创新。当前创新点是人物模板构建、直接姿态对齐、连续
+  可靠性融合和全序列时间优化组成的稳定流程；
 - 不要声称 Face branch 动态修改 opacity 或 SH color。网络虽然输出 `d_opa`，当前 renderer 没有
   应用它，实际动态更新的是 position、rotation 和 scale；
 - 不要仅凭总体 PSNR/LPIPS 证明尺度路由或头部稳定。每个主张都需要对应证据。
@@ -816,7 +917,7 @@ deformation MLP predicts local face motion in the refined coordinate system
 
 为了验证两个创新点及 QGSFM 内部两个子模块的作用，建议至少设置以下递进消融：
 
-| 实验 | SQAF | Modulation pyramid | Scale router | LPHS | 回答的问题 |
+| 实验 | SQAF | Modulation pyramid | Scale router | CFHS | 回答的问题 |
 | --- | --- | --- | --- | --- | --- |
 | A0 TalkingGaussian baseline |  |  |  |  | 原始性能 |
 | A1 global/ungated modulation |  |  |  |  | 仅增加调制是否有效 |
@@ -831,8 +932,9 @@ deformation MLP predicts local face motion in the refined coordinate system
   heatmap；去掉 query、去掉 gate、固定平均 gate 的消融；
 - QGSFM/GSAM 子模块：固定 `8×8`、固定 `16×16`、固定 `32×32`、uniform multi-scale 和 learned
   router 对比；按 Gaussian scale 分组统计 routing weights；嘴角、眼睑等局部 crop 的质量；
-- LPHS：按 yaw 区间报告 LVD、tOF、Flow Warp Error 或 pose acceleration；与粗 3DMM
-  tracking、普通平滑和固定语义权重对比；展示大姿态自遮挡序列；
+- CFHS：按 yaw 区间报告 LVD、tOF、Flow Warp Error 和 pose acceleration；与粗 3DMM、
+  普通轨迹平滑、无连续置信度、无时间约束以及通用/人物/表情不敏感模板对比；重点展示
+  ‘转头—遮挡—返回’序列；
 - 完整模型：PSNR、SSIM、LPIPS、FID、CSIM 等总体指标，以及 lip synchronization 指标。总体
   图像质量与时间稳定性应分别报告，避免单一指标承担全部结论。
 

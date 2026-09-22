@@ -47,6 +47,16 @@ class CanonicalAlignmentConfig:
     max_rotation_degrees: float = 10.0
     max_translation_ratio: float = 0.05
     minimum_improvement: float = 0.05
+    confidence_anchor_high_ratio: float = 1.50
+    confidence_spatial_extent_low: float = 0.025
+    confidence_spatial_extent_high: float = 0.075
+    confidence_coverage_retention_low: float = 0.70
+    confidence_bound_margin_high: float = 0.25
+    lambda_temporal_velocity: float = 0.15
+    lambda_temporal_acceleration: float = 0.05
+    lambda_temporal_coarse: float = 0.10
+    temporal_optimization_steps: int = 100
+    temporal_learning_rate: float = 0.05
     expression_pca_components: int = 8
     expression_ridge: float = 1e-3
     visibility_max_side: int = 256
@@ -62,6 +72,24 @@ class CanonicalAlignmentConfig:
             raise ValueError("min_template_frames must be positive")
         if not 0.0 < self.template_train_fraction <= 1.0:
             raise ValueError("template_train_fraction must be in (0, 1]")
+        if self.confidence_anchor_high_ratio <= 1.0:
+            raise ValueError("confidence_anchor_high_ratio must be greater than 1")
+        if not 0.0 <= self.confidence_spatial_extent_low < self.confidence_spatial_extent_high:
+            raise ValueError("canonical spatial extent thresholds are invalid")
+        if not 0.0 <= self.confidence_coverage_retention_low < 1.0:
+            raise ValueError("confidence_coverage_retention_low must be in [0, 1)")
+        if not 0.0 < self.confidence_bound_margin_high <= 1.0:
+            raise ValueError("confidence_bound_margin_high must be in (0, 1]")
+        if min(
+            self.lambda_temporal_velocity,
+            self.lambda_temporal_acceleration,
+            self.lambda_temporal_coarse,
+        ) < 0.0:
+            raise ValueError("canonical temporal loss weights must be non-negative")
+        if self.temporal_optimization_steps < 0:
+            raise ValueError("temporal_optimization_steps must be non-negative")
+        if self.temporal_learning_rate <= 0.0:
+            raise ValueError("temporal_learning_rate must be positive")
 
 
 def _sha256(path, block_size=1024 * 1024):
@@ -316,15 +344,80 @@ def _alignment_loss(feature, mask, points, target, weights, width, height):
     return loss, active
 
 
+def _smoothstep(value, low, high):
+    """Map a reliability measurement continuously to [0, 1]."""
+    if high <= low:
+        raise ValueError("smoothstep requires high > low")
+    normalized = ((value - low) / (high - low)).clamp(0.0, 1.0)
+    return normalized.square() * (3.0 - 2.0 * normalized)
+
+
+def _spatial_extent(points, active, width, height):
+    """Return the geometric mean of weighted x/y spread in image coordinates."""
+    weights = active.clamp_min(0.0)
+    weight_sum = weights.sum(dim=1).clamp_min(1e-8)
+    mean = (points * weights[..., None]).sum(dim=1) / weight_sum[:, None]
+    variance = (
+        (points - mean[:, None]).square() * weights[..., None]
+    ).sum(dim=1) / weight_sum[:, None]
+    std = variance.clamp_min(0.0).sqrt()
+    normalized_x = std[:, 0] / max(float(width), 1.0)
+    normalized_y = std[:, 1] / max(float(height), 1.0)
+    return (normalized_x * normalized_y).clamp_min(0.0).sqrt()
+
+
+def _temporal_refine_deltas(deltas, confidence, max_rotation, max_translation, config):
+    """Refine the complete correction sequence without batch-boundary gaps."""
+    if len(deltas) < 2 or config.temporal_optimization_steps == 0:
+        return deltas.detach()
+    scale = deltas.new_tensor([
+        max_rotation, max_rotation, max_rotation,
+        float(max_translation), float(max_translation), float(max_translation),
+    ]).clamp_min(1e-8)
+    target = (deltas / scale).detach()
+    refined = torch.nn.Parameter(target.clone())
+    confidence = confidence.detach().clamp(0.0, 1.0)
+    data_weight = 0.25 + 0.75 * confidence
+    optimizer = torch.optim.Adam([refined], lr=config.temporal_learning_rate)
+    for _ in range(config.temporal_optimization_steps):
+        data_loss = (
+            (refined - target).square() * data_weight[:, None]
+        ).mean()
+        coarse_loss = (
+            refined.square() * (1.0 - confidence[:, None])
+        ).mean()
+        velocity_loss = (refined[1:] - refined[:-1]).square().mean()
+        if len(refined) > 2:
+            acceleration = refined[2:] - 2.0 * refined[1:-1] + refined[:-2]
+            acceleration_loss = acceleration.square().mean()
+        else:
+            acceleration_loss = refined.new_zeros(())
+        loss = (
+            data_loss
+            + config.lambda_temporal_coarse * coarse_loss
+            + config.lambda_temporal_velocity * velocity_loss
+            + config.lambda_temporal_acceleration * acceleration_loss
+        )
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+    return (refined.detach() * scale).to(deltas.dtype)
+
+
 def _optimize_frames(
     cache, geometry, base_rotation, base_translation, visibility, target,
     reliability, focal, center, width, height, config, device,
 ):
-    rotations = []
-    translations = []
+    applied_deltas = []
+    confidences = []
     frame_diagnostics = []
     target = torch.from_numpy(target).to(device)
     reliability = torch.from_numpy(reliability).to(device)
+    reliable_anchor_count = int((reliability > 0.05).sum().item())
+    required_anchors = min(
+        config.min_alignment_anchors,
+        max(12, int(round(0.15 * reliable_anchor_count))),
+    )
     depth = torch.median(torch.abs(base_translation[:, 2])).to(device).clamp_min(1e-6)
     max_rotation = math.radians(config.max_rotation_degrees)
     max_translation = config.max_translation_ratio * depth
@@ -355,13 +448,14 @@ def _optimize_frames(
                 (delta[:, :3] / max_rotation, delta[:, 3:] / max_translation), dim=1
             )
             objective = align_loss + config.lambda_pose_prior * scaled.square().mean(dim=1)
-            return align_loss, objective, active
+            return align_loss, objective, active, points
 
         with torch.no_grad():
-            initial_loss, _, initial_active = evaluate()
+            initial_loss, _, initial_active, initial_points = evaluate()
         effective = (initial_active > 0.05).sum(dim=1)
         finite_initial = torch.isfinite(initial_loss)
-        optimizable = (effective >= config.min_alignment_anchors) & finite_initial
+        minimum_optimization_anchors = max(6, required_anchors // 2)
+        optimizable = (effective >= minimum_optimization_anchors) & finite_initial
         if bool(optimizable.any().item()):
             for steps, learning_rate in (
                 (config.optimization_steps_coarse, config.learning_rate_coarse),
@@ -369,7 +463,7 @@ def _optimize_frames(
             ):
                 optimizer = torch.optim.Adam([delta], lr=learning_rate)
                 for _ in range(steps):
-                    _, objective, _ = evaluate()
+                    _, objective, _, _ = evaluate()
                     loss = objective[optimizable].mean()
                     optimizer.zero_grad()
                     loss.backward()
@@ -388,7 +482,7 @@ def _optimize_frames(
                             max_translation / translation_norm, max=1.0
                         )
         with torch.no_grad():
-            final_loss, _, _ = evaluate()
+            final_loss, _, final_active, final_points = evaluate()
             finite_final = torch.isfinite(final_loss)
             improvement = torch.where(
                 finite_initial & finite_final,
@@ -397,40 +491,127 @@ def _optimize_frames(
             )
             rotation_norm = torch.linalg.norm(delta[:, :3], dim=1)
             translation_norm = torch.linalg.norm(delta[:, 3:], dim=1)
-            accepted = (
-                optimizable
-                & (improvement >= config.minimum_improvement)
-                & (rotation_norm < max_rotation * 0.999)
-                & (translation_norm < max_translation * 0.999)
-                & finite_final
+            final_effective = (final_active > 0.05).sum(dim=1)
+            anchor_confidence = _smoothstep(
+                effective.float(), float(minimum_optimization_anchors),
+                float(required_anchors) * config.confidence_anchor_high_ratio,
             )
-            refined_r, refined_t = compose_increment(delta, base_r, base_t)
-            rotation = torch.where(accepted[:, None, None], refined_r, base_r)
-            translation = torch.where(accepted[:, None], refined_t, base_t)
-            accepted_delta = torch.where(accepted[:, None], delta, torch.zeros_like(delta))
-        rotations.append(rotation.detach().cpu())
-        translations.append(translation.detach().cpu())
+            improvement_confidence = _smoothstep(
+                improvement, 0.0, max(config.minimum_improvement * 2.0, 1e-6)
+            )
+            coverage_retention = (
+                final_effective.float() / effective.float().clamp_min(1.0)
+            ).clamp(max=1.0)
+            coverage_confidence = _smoothstep(
+                coverage_retention,
+                config.confidence_coverage_retention_low,
+                1.0,
+            )
+            initial_extent = _spatial_extent(
+                initial_points, initial_active, width, height
+            )
+            final_extent = _spatial_extent(final_points, final_active, width, height)
+            spatial_extent = torch.minimum(initial_extent, final_extent)
+            spatial_confidence = _smoothstep(
+                spatial_extent,
+                config.confidence_spatial_extent_low,
+                config.confidence_spatial_extent_high,
+            )
+            bound_ratio = torch.maximum(
+                rotation_norm / max_rotation,
+                translation_norm / max_translation,
+            )
+            bound_confidence = _smoothstep(
+                1.0 - bound_ratio,
+                0.0,
+                config.confidence_bound_margin_high,
+            )
+            confidence_product = (
+                anchor_confidence
+                * improvement_confidence
+                * coverage_confidence
+                * spatial_confidence
+                * bound_confidence
+            )
+            confidence = confidence_product.clamp_min(0.0).pow(1.0 / 5.0)
+            confidence = torch.where(
+                optimizable & finite_final, confidence, torch.zeros_like(confidence)
+            )
+            applied_delta = delta * confidence[:, None]
+            # Backward-compatible high-confidence diagnostic; it no longer
+            # controls an all-or-nothing pose switch.
+            accepted = confidence >= 0.5
+        applied_deltas.append(applied_delta.detach())
+        confidences.append(confidence.detach())
         for local_index, frame_id in enumerate(range(start, end)):
             frame_diagnostics.append({
                 "frame": frame_id,
                 "effective_anchors": int(effective[local_index]),
+                "final_effective_anchors": int(final_effective[local_index]),
+                "required_anchors": required_anchors,
+                "minimum_optimization_anchors": minimum_optimization_anchors,
                 "initial_loss": float(initial_loss[local_index])
                 if finite_initial[local_index] else None,
                 "final_loss": float(final_loss[local_index])
                 if finite_final[local_index] else None,
                 "improvement": float(improvement[local_index]),
+                "confidence": float(confidence[local_index]),
+                "anchor_confidence": float(anchor_confidence[local_index]),
+                "improvement_confidence": float(improvement_confidence[local_index]),
+                "coverage_retention": float(coverage_retention[local_index]),
+                "coverage_confidence": float(coverage_confidence[local_index]),
+                "spatial_extent": float(spatial_extent[local_index]),
+                "spatial_confidence": float(spatial_confidence[local_index]),
+                "bound_confidence": float(bound_confidence[local_index]),
                 "accepted": bool(accepted[local_index]),
                 "rotation_correction_deg": float(
-                    torch.linalg.norm(accepted_delta[local_index, :3])
+                    torch.linalg.norm(applied_delta[local_index, :3])
                     * 180.0 / math.pi
                 ),
                 "translation_correction_ratio": float(
-                    torch.linalg.norm(accepted_delta[local_index, 3:]) / depth
+                    torch.linalg.norm(applied_delta[local_index, 3:]) / depth
+                ),
+                "raw_rotation_correction_deg": float(
+                    rotation_norm[local_index] * 180.0 / math.pi
+                ),
+                "raw_translation_correction_ratio": float(
+                    translation_norm[local_index] / depth
                 ),
             })
         progress.update(end - start)
     progress.close()
-    return torch.cat(rotations), torch.cat(translations), frame_diagnostics
+    pre_temporal_delta = torch.cat(applied_deltas)
+    confidence = torch.cat(confidences)
+    temporal_delta = _temporal_refine_deltas(
+        pre_temporal_delta, confidence, max_rotation, max_translation, config
+    )
+    rotation, translation = compose_increment(
+        temporal_delta,
+        base_rotation.to(device),
+        base_translation.to(device),
+    )
+    for index, diagnostic in enumerate(frame_diagnostics):
+        before = pre_temporal_delta[index]
+        after = temporal_delta[index]
+        diagnostic["pre_temporal_rotation_correction_deg"] = float(
+            torch.linalg.norm(before[:3]) * 180.0 / math.pi
+        )
+        diagnostic["pre_temporal_translation_correction_ratio"] = float(
+            torch.linalg.norm(before[3:]) / depth
+        )
+        diagnostic["rotation_correction_deg"] = float(
+            torch.linalg.norm(after[:3]) * 180.0 / math.pi
+        )
+        diagnostic["translation_correction_ratio"] = float(
+            torch.linalg.norm(after[3:]) / depth
+        )
+        diagnostic["temporal_adjustment_norm"] = float(
+            torch.linalg.norm((after - before) / torch.cat((
+                before.new_full((3,), max_rotation),
+                before.new_full((3,), float(max_translation)),
+            )))
+        )
+    return rotation.detach().cpu(), translation.detach().cpu(), frame_diagnostics
 
 
 def _return_events(yaw, diagnostics):
@@ -452,6 +633,9 @@ def _return_events(yaw, diagnostics):
                 ])) if subset else None,
                 "return_acceptance_rate": float(np.mean([
                     item["accepted"] for item in subset
+                ])) if subset else None,
+                "return_mean_confidence": float(np.mean([
+                    item.get("confidence", float(item["accepted"])) for item in subset
                 ])) if subset else None,
                 "return_landmark_reprojection_px": float(np.mean([
                     item["landmark_reprojection_after_px"] for item in subset
@@ -554,8 +738,8 @@ def run_canonical_alignment(
         reliability, focal, center, width, height, config, device,
     )
 
-    accepted = np.asarray([item["accepted"] for item in first_diagnostics])
-    second_selected = [index for index in selected if accepted[index]]
+    confidence = np.asarray([item["confidence"] for item in first_diagnostics])
+    second_selected = [index for index in selected if confidence[index] >= 0.5]
     if len(second_selected) < config.min_template_frames:
         second_selected = selected
     refined_params = dict(params)
@@ -632,6 +816,15 @@ def run_canonical_alignment(
         "selection_reprojection_limit": selection["reprojection_limit"],
         "template_source_frame_count": selection["template_frame_count"],
         "accepted_frames": int(sum(item["accepted"] for item in frame_diagnostics)),
+        "applied_frames": int(sum(
+            item["confidence"] > 0.0 for item in frame_diagnostics
+        )),
+        "mean_confidence": float(np.mean([
+            item["confidence"] for item in frame_diagnostics
+        ])),
+        "median_confidence": float(np.median([
+            item["confidence"] for item in frame_diagnostics
+        ])),
         "before": {
             key: value for key, value in before_pose.items()
             if key != "frame_landmark_reprojection_px"
