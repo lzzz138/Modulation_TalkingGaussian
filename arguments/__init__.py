@@ -54,6 +54,7 @@ class ModelParams(ParamGroup):
         self._white_background = False
         self.data_device = "cpu"
         self.eval = False
+        self.uvw_pose = False
         self.audio = ""
         self.init_num = 10_000
         self.audio_extractor = "deepspeech"

@@ -44,6 +44,7 @@ class GaussianModel:
     def __init__(self, sh_degree : int):
         self.active_sh_degree = 0
         self.max_sh_degree = sh_degree  
+        self.fixed_uvw = None
         self._xyz = torch.empty(0)
         self._features_dc = torch.empty(0)
         self._features_rest = torch.empty(0)
@@ -322,6 +323,8 @@ class GaussianModel:
 
     def prune_points(self, mask):
         valid_points_mask = ~mask
+        if self.fixed_uvw is not None:
+            self.fixed_uvw.select(valid_points_mask)
         optimizable_tensors = self._prune_optimizer(valid_points_mask)
 
         self._xyz = optimizable_tensors["xyz"]
@@ -403,6 +406,9 @@ class GaussianModel:
         new_identity = self._identity[selected_pts_mask].repeat(N,1)
         new_opacity = self._opacity[selected_pts_mask].repeat(N,1)
 
+        if self.fixed_uvw is not None:
+            parents = torch.where(selected_pts_mask)[0].repeat(N)
+            self.fixed_uvw.append_parents(parents)
         self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_identity, new_opacity, new_scaling, new_rotation)
 
         prune_filter = torch.cat((selected_pts_mask, torch.zeros(N * selected_pts_mask.sum(), device="cuda", dtype=bool)))
@@ -422,6 +428,8 @@ class GaussianModel:
         new_scaling = self._scaling[selected_pts_mask]
         new_rotation = self._rotation[selected_pts_mask]
 
+        if self.fixed_uvw is not None:
+            self.fixed_uvw.append_parents(torch.where(selected_pts_mask)[0])
         self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_identity, new_opacities, new_scaling, new_rotation)
 
     def densify_and_prune(self, max_grad, min_opacity, extent, max_screen_size):

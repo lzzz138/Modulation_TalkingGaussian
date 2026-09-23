@@ -34,6 +34,11 @@ if os.environ.get('TALKING_GAUSSIAN_TENSORBOARD') == '1':
     TENSORBOARD_FOUND = True
 
 def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from):
+    for _ in training_steps(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from):
+        pass
+
+
+def training_steps(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, runtime=None):
     testing_iterations = [i for i in range(0, opt.iterations + 1, 2000)]
     checkpoint_iterations =  saving_iterations = [i for i in range(0, opt.iterations + 1, 10000)] + [opt.iterations]
 
@@ -49,7 +54,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     first_iter = 0
     tb_writer = prepare_output_and_logger(dataset)
     gaussians = GaussianModel(dataset.sh_degree)
-    scene = Scene(dataset, gaussians)
+    scene = Scene(dataset, gaussians) if runtime is None else runtime.make_scene(dataset, gaussians, 'mouth')
 
     motion_net = MouthMotionNetwork(args=dataset).cuda()
     motion_optimizer = torch.optim.AdamW(motion_net.get_params(5e-3, 5e-4), betas=(0.9, 0.99), eps=1e-8)
@@ -64,6 +69,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         motion_net.load_state_dict(motion_params)
         motion_optimizer.load_state_dict(motion_optimizer_params)
 
+    if runtime is not None:
+        first_iter, saved_stack = runtime.restore_branch('mouth', gaussians, motion_net, motion_optimizer, scheduler)
+
     bg_color = [0, 1, 0] # if dataset.white_background else [0, 0, 0]
     background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
 
@@ -71,9 +79,12 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     iter_start = torch.cuda.Event(enable_timing = True)
     iter_end = torch.cuda.Event(enable_timing = True)
 
-    viewpoint_stack = None
+    viewpoint_stack = None if runtime is None else saved_stack
     ema_loss_for_log = 0.0
     progress_bar = tqdm(range(first_iter, opt.iterations), ascii=True, dynamic_ncols=True, desc="Training progress")
+    if runtime is not None:
+        yield dict(branch='mouth', iteration=first_iter, gaussians=gaussians, motion=motion_net,
+                   optimizer=motion_optimizer, scheduler=scheduler, stack=viewpoint_stack, initialized=True)
     first_iter += 1
     for iteration in range(first_iter, opt.iterations + 1):        
 
@@ -99,7 +110,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         au_ub = au_global_ub
         au_lb = au_ub - mouth_step * iteration * (au_global_ub - au_global_lb)
 
-        if iteration < warm_step:
+        if iteration < warm_step or (runtime is not None and iteration == warm_step):
             while viewpoint_cam.talking_dict['au25'][0] < au_global_ub:
                 if not viewpoint_stack:
                     viewpoint_stack = scene.getTrainCameras().copy()
@@ -125,6 +136,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         if viewpoint_cam.original_image == None:
             viewpoint_cam = loadCamOnTheFly(copy.deepcopy(viewpoint_cam))
 
+        if runtime is not None:
+            viewpoint_cam = runtime.camera(viewpoint_cam)
+
         # Render
         if (iteration - 1) == debug_from:
             pipe.debug = True
@@ -143,7 +157,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         lips_mask = torch.zeros_like(mouth_mask)
         lips_mask[xmin:xmax, ymin:ymax] = True
 
-        if iteration < warm_step:
+        if iteration < warm_step or (runtime is not None and iteration == warm_step):
             render_pkg = render(viewpoint_cam, gaussians, pipe, background)
         else:
             render_pkg = render_motion_mouth(viewpoint_cam, gaussians, motion_net, pipe, background)
@@ -203,7 +217,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
             # Log and save
             training_report(tb_writer, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, motion_net, render if iteration < warm_step else render_motion_mouth, (pipe, background))
-            if (iteration in checkpoint_iterations):
+            if runtime is None and (iteration in checkpoint_iterations):
                 print("\n[ITER {}] Saving Checkpoint".format(iteration))
                 ckpt = (gaussians.capture(), motion_net.state_dict(), motion_optimizer.state_dict(), iteration)
                 torch.save(ckpt, scene.model_path + "/chkpnt_mouth_" + str(iteration) + ".pth")
@@ -236,7 +250,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 #     gaussians.reset_opacity()
 
             # Optimizer step
-            if iteration < opt.iterations:
+            if iteration < opt.iterations or runtime is not None:
                 motion_optimizer.step()
                 gaussians.optimizer.step()
 
@@ -245,6 +259,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
                 scheduler.step()
 
+        if runtime is not None:
+            yield dict(branch='mouth', iteration=iteration, gaussians=gaussians, motion=motion_net,
+                       optimizer=motion_optimizer, scheduler=scheduler, stack=viewpoint_stack)
 
 
 def prepare_output_and_logger(args):    

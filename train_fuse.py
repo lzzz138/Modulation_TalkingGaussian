@@ -3,7 +3,7 @@
 # GRAPHDECO research group, https://team.inria.fr/graphdeco
 # All rights reserved.
 #
-# This software is free for non-commercial, research and evaluation use 
+# This software is free for non-commercial, research and evaluation use
 # under the terms of the LICENSE.md file.
 #
 # For inquiries contact  george.drettakis@inria.fr
@@ -46,7 +46,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
     first_iter = 0
     tb_writer = prepare_output_and_logger(dataset)
-    
+
     gaussians = GaussianModel(dataset.sh_degree)
     scene = Scene(dataset, gaussians)
     gaussians_mouth = GaussianModel(dataset.sh_degree)
@@ -57,14 +57,27 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     gaussians.training_setup(opt)
     gaussians_mouth.training_setup(opt)
 
-    (model_params, motion_params, _, _) = torch.load(os.path.join(scene.model_path, "chkpnt_face_latest.pth"))
-    gaussians.restore(model_params, opt)
-    motion_net.validate_multiscale_checkpoint(motion_params)
-    motion_net.load_state_dict(motion_params)
+    joint_path = os.path.join(scene.model_path, 'chkpnt_uvw_latest.pth')
+    uvw_checkpoint = None
+    if dataset.uvw_pose:
+        if not os.path.isfile(joint_path):
+            raise ValueError("UVW mode requires chkpnt_uvw_latest.pth")
+        from scene.uvw_checkpoint import attach_pose, load_joint
+        uvw_checkpoint = torch.load(joint_path)
+        load_joint(uvw_checkpoint, gaussians, motion_net, gaussians_mouth, motion_net_mouth, opt)
+        attach_pose(scene, dataset, uvw_checkpoint)
+        for network in (motion_net, motion_net_mouth):
+            for parameter in network.parameters():
+                parameter.requires_grad_(False)
+    else:
+        (model_params, motion_params, _, _) = torch.load(os.path.join(scene.model_path, "chkpnt_face_latest.pth"))
+        gaussians.restore(model_params, opt)
+        motion_net.validate_multiscale_checkpoint(motion_params)
+        motion_net.load_state_dict(motion_params)
 
-    (model_params, motion_params, _, _) = torch.load(os.path.join(scene.model_path, "chkpnt_mouth_latest.pth"))
-    gaussians_mouth.restore(model_params, opt)
-    motion_net_mouth.load_state_dict(motion_params)
+        (model_params, motion_params, _, _) = torch.load(os.path.join(scene.model_path, "chkpnt_mouth_latest.pth"))
+        gaussians_mouth.restore(model_params, opt)
+        motion_net_mouth.load_state_dict(motion_params)
 
     lpips_criterion = lpips.LPIPS(net='alex').eval().cuda()
 
@@ -80,7 +93,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     progress_bar = tqdm(range(first_iter, opt.iterations), ascii=True, dynamic_ncols=True, desc="Training progress")
     first_iter += 1
 
-    for iteration in range(first_iter, opt.iterations + 1):        
+    for iteration in range(first_iter, opt.iterations + 1):
 
         iter_start.record()
 
@@ -112,7 +125,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         alpha = render_pkg["alpha"]
         mouth_image = render_pkg_mouth["render"] - background[:, None, None] * (1.0 - alpha_mouth) + viewpoint_cam.background.cuda() / 255.0 * (1.0 - alpha_mouth)
         image = render_pkg["render"] - background[:, None, None] * (1.0 - alpha) + mouth_image * (1.0 - alpha)
-                
+
         gt_image  = viewpoint_cam.original_image.cuda() / 255.0
         gt_image_white = gt_image * head_mask + background[:, None, None] * ~head_mask
 
@@ -121,7 +134,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 param.requires_grad = False
             for param in motion_net_mouth.parameters():
                 param.requires_grad = False
-                
+
             gaussians._xyz.requires_grad = False
             # gaussians._opacity.requires_grad = False
             gaussians._scaling.requires_grad = False
@@ -131,10 +144,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             gaussians_mouth._opacity.requires_grad = False
             gaussians_mouth._scaling.requires_grad = False
             gaussians_mouth._rotation.requires_grad = False
-        
+
 
         # Loss
-        if iteration < bg_iter:            
+        if iteration < bg_iter:
             image[:, ~head_mask] = background[:, None]
             # gt_image_white[:, ~head_mask] = background[:, None]
 
@@ -152,12 +165,12 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             image_t = image.clone()
             gt_image_t = gt_image.clone()
 
-        if iteration > lpips_start_iter:        
+        if iteration > lpips_start_iter:
             # mask mouth
             # [xmin, xmax, ymin, ymax] = viewpoint_cam.talking_dict['lips_rect']
             # image_t[:, xmin:xmax, ymin:ymax] = 1
             # gt_image_t[:, xmin:xmax, ymin:ymax] = 1
-            
+
             patch_size = random.randint(16, 21) * 2
             loss += 0.5 * lpips_criterion(patchify(image_t[None, ...] * 2 - 1, patch_size), patchify(gt_image_t[None, ...] * 2 - 1, patch_size)).mean()
 
@@ -182,11 +195,6 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 print("\n[ITER {}] Saving Gaussians".format(iteration))
                 scene.save(iteration)
 
-            if (iteration in checkpoint_iterations):
-                print("\n[ITER {}] Saving Checkpoint".format(iteration))
-                ckpt = (gaussians.capture(), motion_net.state_dict(), gaussians_mouth.capture(), motion_net_mouth.state_dict())
-                torch.save(ckpt, scene.model_path + "/chkpnt_fuse_" + str(iteration) + ".pth")
-                torch.save(ckpt, scene.model_path + "/chkpnt_fuse_latest" + ".pth")
 
 
             # Densification
@@ -202,22 +210,36 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
 
             # Optimizer step
-            if iteration < opt.iterations:
+            if iteration < opt.iterations or uvw_checkpoint is not None:
                 gaussians.optimizer.step()
                 gaussians_mouth.optimizer.step()
 
                 gaussians.optimizer.zero_grad(set_to_none = True)
                 gaussians_mouth.optimizer.zero_grad(set_to_none = True)
 
+            if (iteration in checkpoint_iterations):
+                print("\n[ITER {}] Saving Checkpoint".format(iteration))
+                ckpt = (gaussians.capture(), motion_net.state_dict(), gaussians_mouth.capture(), motion_net_mouth.state_dict())
+                if uvw_checkpoint is not None:
+                    ckpt = dict(format='uvw_pose_fuse_v1', iteration=iteration,
+                                dataset_digest=uvw_checkpoint['dataset_digest'],
+                                pose=uvw_checkpoint['pose'], config=uvw_checkpoint['config'],
+                                binding_ids=uvw_checkpoint['binding_ids'], feature_scale=uvw_checkpoint['feature_scale'],
+                                branches={
+                                    'face': dict(gaussians=gaussians.capture(), motion=motion_net.state_dict(), uvw=gaussians.fixed_uvw.state_dict()),
+                                    'mouth': dict(gaussians=gaussians_mouth.capture(), motion=motion_net_mouth.state_dict(), uvw=None)})
+                torch.save(ckpt, scene.model_path + "/chkpnt_fuse_" + str(iteration) + ".pth")
+                torch.save(ckpt, scene.model_path + "/chkpnt_fuse_latest" + ".pth")
 
-def prepare_output_and_logger(args):    
+
+def prepare_output_and_logger(args):
     if not args.model_path:
         if os.getenv('OAR_JOB_ID'):
             unique_str=os.getenv('OAR_JOB_ID')
         else:
             unique_str = str(uuid.uuid4())
         args.model_path = os.path.join("./output/", unique_str[0:10])
-        
+
     # Set up output folder
     print("Output folder: {}".format(args.model_path))
     os.makedirs(args.model_path, exist_ok = True)
@@ -256,7 +278,7 @@ if __name__ == "__main__":
     parser.add_argument("--start_checkpoint", type=str, default = None)
     args = parser.parse_args(sys.argv[1:])
     args.save_iterations.append(args.iterations)
-    
+
     print("Optimizing " + args.model_path)
 
     # Initialize system state (RNG)

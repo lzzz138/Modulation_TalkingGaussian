@@ -926,8 +926,8 @@ class VideoMetricsCalculator:
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('gen_video', nargs='?', default='/home/lzq/paperCode/talkinghead/TalkingGaussian/output/posevideo_canonical_fixed2/test/ours_None/renders/out.mp4')
-    parser.add_argument('real_video', nargs='?', default='/home/lzq/paperCode/talkinghead/TalkingGaussian/output/posevideo_canonical_fixed2/test/ours_None/gt/out.mp4')
+    parser.add_argument('gen_video', nargs='?', default='/home/lzq/paperCode/talkinghead/TalkingGaussian/output/posevideo_uvw_pose2/test/ours_None/renders/out.mp4')
+    parser.add_argument('real_video', nargs='?', default='/home/lzq/paperCode/talkinghead/TalkingGaussian/output/posevideo_uvw_pose/test/ours_None/gt/out.mp4')
     parser.add_argument('--device', default='cuda')
     parser.add_argument('--batch_size', type=int, default=32)
     parser.add_argument('--max_frames', type=int, default=None)
