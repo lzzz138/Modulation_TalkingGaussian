@@ -45,7 +45,8 @@ class Runtime:
 
     def configuration(self):
         return dict(iterations=self.options.iterations, interval=self.args.pose_interval,
-                    stop=self.args.pose_stop, pose_enabled=not self.args.fixed_pose_control,
+                    start=self.args.pose_start, stop=self.args.pose_stop,
+                    pose_enabled=not self.args.fixed_pose_control,
                     model={k: v for k, v in vars(self.dataset).items() if k not in ('model_path', 'source_path', 'eval')},
                     optimization=vars(self.options).copy(),
                     binding=dict(max_frames=64, yaw_bin_degrees=15, min_observations=5, min_yaw_bins=2, residual_limit=0.05),
@@ -221,7 +222,9 @@ def main():
     parser.add_argument('--pose_acceleration_ramp', type=int, default=1500,
                         help='Accepted updates used to ramp acceleration weight to 0.05')
     parser.add_argument('--pose_interval', type=int, default=5)
-    parser.add_argument('--pose_stop', type=int, default=45000)
+    parser.add_argument('--pose_start', type=int, default=6000,
+                        help='First training iteration at which online pose updates are enabled')
+    parser.add_argument('--pose_stop', type=int, default=40000)
     parser.add_argument('--fixed_pose_control', action='store_true')
     parser.add_argument('--checkpoint_every', type=int, default=1000)
     args = parser.parse_args()
@@ -229,6 +232,8 @@ def main():
             or args.pose_acceleration_delay < 0
             or args.pose_acceleration_ramp < 0):
         parser.error('intervals must be positive')
+    if args.pose_start < 3000 or args.pose_stop <= args.pose_start:
+        parser.error('pose_start must be at least 3000 and smaller than pose_stop')
     args.eval = False
     args.uvw_pose = True
     safe_state(False)
@@ -258,7 +263,9 @@ def main():
                 assert states[branch]['iteration'] == iteration
             if iteration == 3000:
                 runtime.bind(states['face'])
-            if 3000 < iteration < args.pose_stop and iteration % args.pose_interval == 0 and not args.fixed_pose_control:
+            if (args.pose_start <= iteration < args.pose_stop
+                    and iteration % args.pose_interval == 0
+                    and not args.fixed_pose_control):
                 report = runtime.pose_step(states['face'], iteration)
                 log.write(json.dumps(report) + '\n'); log.flush()
             if iteration % args.checkpoint_every == 0 or iteration == last:
