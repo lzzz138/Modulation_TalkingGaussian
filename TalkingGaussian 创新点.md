@@ -1,11 +1,11 @@
 # TalkingGaussian Baseline Enhacement
 
-## 11. 当前项目相对于 TalkingGaussian 的两个主要创新点
+## 11. 当前项目相对于 TalkingGaussian 的三个主要创新点
 
 当前项目保留 TalkingGaussian 原有的 **Face–Mouth Decomposition**：Face branch 负责头部、
 上半脸和整体面部形变，Mouth branch 独立负责口腔内部 Gaussian 的位置形变，最后通过同一个
 3D Gaussian Rasterizer 合成。本文的修改包含一个由两个子模块组成的在线 Face branch 方法，
-以及一个离线数据处理方法：
+一个离线头姿校准方法，以及一个训练内位姿优化方法：
 
 1. **Query-Guided Scale-Aware Face Modulation（QGSFM）**
 
@@ -19,11 +19,15 @@
 
    在 3DMM 粗跟踪之后、生成 `transforms_train.json` 和 `transforms_val.json` 之前，从可靠训练帧建立人物专属 canonical 特征模板，让每帧直接对齐同一模板，并通过连续置信度与全序列 SE(3) 时间约束修正相机姿态。
 
+3. **固定 UVW 对应引导的交替位姿优化（Fixed-UVW-Guided Alternating Pose Refinement）**
+
+   以 CFHS 输出为初始相机，在 Face 和 Mouth 的静态预热后，从可靠的多视角训练帧为部分 Face Gaussian 绑定固定 DenseMarks UVW 特征。后续同一训练循环交替更新两分支和训练帧位姿；位姿步骤用稳定头部区域的 UVW 一致性、少量 RGB 和时间约束修正相机。
+
 后文使用 `QGSFM` 表示完整的“查询引导尺度感知人脸调制”，使用 `SQAF` 和 `GSAM` 指代其中
 的条件融合与尺度路由子模块；`CFHS` 表示“Canonical 特征头部稳定器”。
 
 第一个创新点 QGSFM 参与 Face motion network 的训练和推理；第二个创新点 CFHS 属于数据
-预处理，只离线生成更稳定的相机外参，不作为训练时的额外神经网络。
+预处理，只离线生成更稳定的相机外参；第三个创新点在训练中进一步修正训练帧相机，也不引入额外 PoseRefiner 网络。
 
 ### 整体流程图
 
@@ -38,6 +42,12 @@
 │                                                        ▼                  │
 │                              transforms_train.json / transforms_val.json  │
 └───────────────────────────────────────────────────────────────────────────┘
+                                                         │
+                                                         ▼
+                    Face/Mouth warmup → fixed Gaussian UVW binding
+                                                         │
+                                                         ▼
+                     Face + Mouth / pose alternating updates
                                                          │
                                                          ▼
                                Shared camera and projection
@@ -716,25 +726,102 @@ DenseMarks 提取环境要求 Python 3.10 或更高；几何可见性和对齐�
 
 ---
 
-## 14. 两个创新点之间的关系
+## 14. 创新点三：固定 UVW 对应引导的交替位姿优化
 
-两个创新点解决的是在线局部形变建模与离线全局坐标稳定两个层级的问题：
+### 14.1 为什么还需要训练内修正
+
+CFHS 在训练前通过 DenseMarks 特征校准 3DMM 位姿，但它看不到最终训练出的 Gaussian
+头像。若相机仍有小偏差，Face/Mouth motion network 可能用非刚性形变去补偿刚性位姿误差。
+第三点让头像自身参与校准：先确定 Gaussian 与规范头部表面的对应，再比较当前相机渲染出的
+UVW 图和视频帧的 DenseMarks UVW 图，利用误差只修正该训练帧的相机位姿。
+
+### 14.2 给 Gaussian 绑定固定 UVW
+
+Face 初始化 2000 个 Gaussian，与 Mouth 分支分别使用离线 CFHS 相机完成前 3000 步静态预热。
+此时才从训练帧中按 yaw 分箱选取最多 64 帧，优先使用离线
+置信度较高的观测。将静态 Face Gaussian 投影到这些帧，在稳定的可见区域采样 DenseMarks
+特征，检查图像边界、mask、渲染 alpha 与深度一致性，并对每个点的多帧观测稳健聚合。
+
+只有至少 5 次有效观测、覆盖至少 2 个 yaw 分箱且特征残差足够小的点才标记为可靠。
+每个 Face Gaussian 保存固定的 `uvw`、`confidence`、`valid`、绑定时位置和尺度；Mouth
+Gaussian 不绑定。增密产生的子点继承父点属性，裁剪时同步裁剪。当前基础中心偏离绑定位置
+越远，UVW 监督权重越低，以免几何漂移后仍把旧对应当作准确观测。绑定属性不参与优化，
+也不会在训练中重新采样。
+
+这里的“64 帧”只用于**一次性确定 Gaussian 的对应**，并不限制后续位姿优化的帧数。
+位姿更新会从整个训练集抽帧，使用被抽中帧自己的 DenseMarks UVW 图。
+
+### 14.3 双分支训练中交替更新位姿
+
+```text
+CFHS 离线相机 → Face/Mouth 1–3000 静态预热 → Face Gaussian 多帧 UVW 绑定
+                                                │
+                                                ▼
+                         Face/Mouth 3001–50k：每 5 次分支更新尝试 1 次位姿更新
+                           ├─ 位姿步：固定 Gaussian 和 motion network
+                           │          用当前音频条件预测形变后的 Gaussian 渲染 UVW/RGB
+                           │          只更新当前训练帧的 6D 相机修正
+                           └─ 分支步：固定位姿与 UVW，沿用 Face/Mouth 各自损失
+                                                │
+                                                ▼
+                           40k 冻结位姿 → 双分支训练完成 → Fuse 10k
+```
+
+默认在第 3000 步完成 UVW 绑定，从第 6000 步起每 5 步尝试一次位姿更新，
+到第 40000 步冻结位姿。位姿步不消耗两个分支各自的 50000 步训练预算；最终相机
+还用于后续 10000 步 Fuse。
+验证帧不参与在线位姿拟合，
+继续使用离线相机。位姿表按全局 `img_id` 索引，避免相机随机抽样后串帧。
+
+位姿步使用**当前形变后的** Face Gaussian，而非仅用静态预热时的几何。渲染器用相同的
+Gaussian 几何、深度排序和透明度分别产生 RGB 与 UVW；无效绑定点仍可遮挡，却不贡献
+UVW 特征。UVW 由可靠特征加权和除以可靠覆盖权重得到，避免把未覆盖像素的零值视为真实
+坐标。监督区域来自 3DMM 稳定表面投影及图像解析，集中在额头、鼻梁和太阳穴，排除
+嘴部、下颌等易随表情变化的区域。整个头部仍随修正后的刚体位姿移动。
+
+位姿目标为稳定区域中的 UVW 误差、少量 RGB L1、偏离 CFHS 初值的先验和相邻训练帧
+修正的速度/加速度约束；加速度权重在初期接受更新后逐渐启用。每帧只优化一个 6D
+旋转和平移修正，最大旋转幅度默认 3°，最大位移为头部深度的 1%。候选更新若损失增加、
+数值无效或可靠覆盖不足就回滚该帧参数及其 Adam 状态。这样，位姿损失不会更新 Gaussian
+或音频形变网络；普通 Gaussian 步也不会改动相机或固定 UVW。
+
+### 14.4 实现入口与证据边界
+
+- `train_uvw_pose.py` 负责 Face/Mouth 联合训练、交替位姿更新和联合 checkpoint；
+- `scene/uvw_pose.py` 保存固定 UVW、逐帧位姿表及候选更新检查；
+- `scene/uvw_observations.py` 读取 DenseMarks 特征和稳定区域；
+- `gaussian_renderer/uvw.py` 提供可对位姿求导的 RGB/UVW 渲染；
+- `scripts/train_uvw_pose.sh` 串联交替训练、Fuse、合成和指标计算。
+
+此前五个视频的 A/B/C 消融分别比较粗 3DMM＋QGSFM、CFHS＋QGSFM、以及
+CFHS＋双分支交替位姿优化＋QGSFM。
+B 到 C 的总体结果**并非单向提升**：部分时间误差及 LPIPS
+略有改善，但 PSNR、SSIM、FID、口部 LMD 和 tLPIPS 的均值变差。因此，本模块当前
+应描述为一个可检验的在线位姿校准机制，不能仅凭图像指标宣称它已稳定提高位姿精度。
+还需要报告注入已知位姿扰动后的旋转/平移恢复误差、可靠 UVW 覆盖率和按 yaw 分组的结果。
+
+---
+
+## 15. 三个创新点之间的关系
+
+三个创新点分别处理局部形变、离线位姿初始化和训练内位姿校准：
 
 | 模块 | 所处阶段 | 主要输入 | 主要输出 | 解决的问题 |
 | --- | --- | --- | --- | --- |
 | QGSFM（由 SQAF 与 GSAM 组成） | Face branch 训练与推理 | audio、AU、learned plane query、Gaussian XYZ 和 base scale | 空间门控融合、多尺度调制与 Gaussian deformation | 异构条件缺少空间分工，且固定调制分辨率与 Gaussian 尺度不匹配 |
 | CFHS | 离线数据预处理 | 视频帧、DenseMarks、粗 3DMM 姿态和几何 | 稳定的相机 `R*, T*` 与 transforms 文件 | 大姿态、自遮挡和逐帧对齐噪声造成的全头抖动 |
+| 固定 UVW 交替位姿优化 | Face/Mouth 联合训练 | CFHS 相机、固定 Gaussian UVW、当前帧 DenseMarks 与 RGB | 训练帧位姿修正及同一相机下的 Face/Mouth 模型 | 离线位姿残差可能被错误吸收到非刚性形变 |
 
 它们最终在渲染阶段汇合：QGSFM 内部先由 SQAF 将音频与 AU 映射为空间调制特征，再由 GSAM
-依据 Gaussian 的空间表征和 canonical scale 选择调制分辨率；CFHS 提供稳定的共享 camera
-transform。原始 Mouth branch 继续预测口腔内部位置形变。这样形成“稳定全局坐标 + 尺度适配
-局部形变”的两级方法。
+依据 Gaussian 的空间表征和 canonical scale 选择调制分辨率；CFHS 提供离线相机初值，
+固定 UVW 交替优化在训练中进一步修正训练帧相机。原始 Mouth branch 继续预测口腔内部
+位置形变。这样形成“离线初始化 + 在线位姿修正 + 尺度适配局部形变”的方法链。
 
 ---
 
-## 15. 论文问题定义与叙事建议
+## 16. 论文问题定义与叙事建议
 
-### 15.1 建议的核心问题
+### 16.1 建议的核心问题
 
 论文不宜把问题简单写成“TalkingGaussian 的调制图分辨率不够”或“我们增加若干模块”。这种表述
 容易被审稿人理解为局部工程改动，而且 CFHS 与 Face branch 看起来缺少联系。
@@ -771,13 +858,14 @@ Reliable and Scale-Aligned Gaussian Motion Learning
                          ▼
            In which coordinate system?
                          │
-                CFHS canonical stabilization
+               CFHS initialization + UVW-guided online pose refinement
 ```
 
-两个创新点覆盖三个相互关联的层次：QGSFM 联合处理 **condition alignment** 和
-**scale alignment**，CFHS 处理 **coordinate reliability**。
+三个创新点覆盖相互关联的层次：QGSFM 联合处理 **condition alignment** 和
+**scale alignment**，CFHS 提供离线 **coordinate initialization**，固定 UVW 对应将
+**coordinate reliability** 延伸到训练过程。
 
-### 15.2 论文故事的逻辑顺序
+### 16.2 论文故事的逻辑顺序
 
 建议 Introduction 按以下顺序展开。
 
@@ -832,14 +920,18 @@ landmark 变少，轮廓点的像素位置与真实表面位置也更难稳定�
 > Scale-aware local motion remains ill-posed when the global camera coordinate is temporally unreliable.
 
 第二个创新点 CFHS 在训练前建立人物专属 canonical 特征模板，使每帧直接对齐同一模板，
-再用连续可靠性融合和全序列 SE(3) 时间约束得到稳定相机外参。
+再用连续可靠性融合和全序列 SE(3) 时间约束得到相机初值。第三个创新点利用多视角固定
+Gaussian UVW 对应，让当前头像的渲染结果在训练中进一步校准训练帧相机。
 
 #### 第五段：方法闭环
 
 最终方法形成以下闭环：
 
 ```text
-CFHS stabilizes the coordinate system
+CFHS provides the initial camera trajectory
+                │
+                ▼
+fixed UVW correspondences guide online pose refinement
                 │
                 ▼
 SQAF aligns audio/AU with spatial regions
@@ -853,7 +945,7 @@ deformation MLP predicts local face motion in the refined coordinate system
 
 论文的主张应落在“更可靠、更细致的 motion learning”上，而不是仅强调网络更复杂。
 
-### 15.3 可以直接用于论文的贡献表述
+### 16.3 可以直接用于论文的贡献表述
 
 英文 contribution list 可以写成：
 
@@ -865,6 +957,9 @@ deformation MLP predicts local face motion in the refined coordinate system
 2. **Canonical Feature Head Stabilizer (CFHS).** We build an expression-insensitive identity template from
    reliable multi-view canonical features, directly align every frame to this shared template, and combine
    continuous alignment confidence with full-sequence SE(3) temporal refinement for stable camera transforms.
+3. **Fixed-UVW-Guided Alternating Pose Refinement.** We robustly bind canonical UVW descriptors to facial
+   Gaussians using reliable multi-view observations, then alternate per-frame camera updates driven by
+   stable-region UVW/RGB rendering consistency with Face and Mouth reconstruction.
 
 中文表述可以写成：
 
@@ -873,22 +968,25 @@ deformation MLP predicts local face motion in the refined coordinate system
    位置与尺度的 Gaussian 自适应混合调制分辨率；
 2. 提出 Canonical 特征头部稳定器（CFHS）：从可靠多视角观测构建表情不敏感的人物模板，
    将每帧直接对齐共享模板，并结合连续置信度与全序列 SE(3) 时间约束生成稳定相机轨迹。
+3. 提出固定 UVW 对应引导的交替位姿优化：通过多视角可靠观测为 Face Gaussian 绑定规范特征，
+   在双分支训练中交替进行稳定区域的渲染位姿校准与原有 Face/Mouth 重建。
 
-### 15.4 摘要中的一句话方法概括
+### 16.4 摘要中的一句话方法概括
 
 可以使用下面这句作为摘要方法部分的基础：
 
 > We present a reliable and scale-aligned Gaussian motion framework that first stabilizes large-pose
-> camera trajectories with CFHS, then spatially fuses audio and AU conditions through SQAF, and finally
-> uses GSAM to route each facial Gaussian to a learned mixture of multi-resolution modulation fields.
+> camera trajectories with CFHS, refines training-frame poses through fixed-UVW rendering consistency,
+> then spatially fuses audio and AU conditions through SQAF and routes facial Gaussians across
+> multi-resolution modulation fields with GSAM.
 
 对应中文：
 
-> 我们提出一种可靠且尺度对齐的 Gaussian 运动建模框架：首先稳定大姿态视频中的相机轨迹，
-> 随后通过 SQAF 对音频和 AU 条件进行空间门控融合，最后由 GSAM 为每个面部 Gaussian
-> 自适应选择多分辨率调制场的组合。
+> 我们提出一种可靠且尺度对齐的 Gaussian 运动建模框架：先由 CFHS 提供离线相机初值，
+> 再用固定 UVW 渲染一致性校准训练帧位姿，同时通过 SQAF 与 GSAM 学习空间化、尺度自适应
+> 的面部形变。
 
-### 15.5 标题方向
+### 16.5 标题方向
 
 如果实验结果同时证明局部质量和大姿态稳定性，可以考虑：
 
@@ -896,10 +994,10 @@ deformation MLP predicts local face motion in the refined coordinate system
 - **ScaleTalkGaussian: Scale-Aligned Motion Fields with Canonical Pose Stabilization**
 - **Stable Gaussian Talking Heads via Query-Guided Modulation and Scale-Aware Routing**
 
-第一种最稳妥，能够覆盖两个创新点且不把论文标题绑定在某一个实现细节上。第二种更强调方法名称，
+第一种覆盖三个创新点且不把论文标题绑定在某一个实现细节上。第二种更强调方法名称，
 但需要全文统一使用该名称。第三种更具体，适合实验主要围绕 Face branch 和稳定性展开的情况。
 
-### 15.6 论文中需要避免的表述
+### 16.6 论文中需要避免的表述
 
 - 不要把 learned plane query 描述成显式人脸语义分割。当前 gate 是从重建监督中学习的空间权重，
   没有区域语义标签；
@@ -912,19 +1010,26 @@ deformation MLP predicts local face motion in the refined coordinate system
 - 不要声称 Face branch 动态修改 opacity 或 SH color。网络虽然输出 `d_opa`，当前 renderer 没有
   应用它，实际动态更新的是 position、rotation 和 scale；
 - 不要仅凭总体 PSNR/LPIPS 证明尺度路由或头部稳定。每个主张都需要对应证据。
+- 不要将 UVW 在线优化描述成验证帧的位姿学习，或声称它已在所有质量指标上超过仅用 CFHS；
+  训练帧在线修正与验证帧离线位姿应分别说明。
 
-### 15.7 建议的实验叙事与消融
+### 16.7 建议的实验叙事与消融
 
-为了验证两个创新点及 QGSFM 内部两个子模块的作用，建议至少设置以下递进消融：
+为了验证三个创新点及 QGSFM 内部两个子模块的作用，建议至少设置以下递进消融：
 
-| 实验 | SQAF | Modulation pyramid | Scale router | CFHS | 回答的问题 |
-| --- | --- | --- | --- | --- | --- |
-| A0 TalkingGaussian baseline |  |  |  |  | 原始性能 |
-| A1 global/ungated modulation |  |  |  |  | 仅增加调制是否有效 |
-| A2 SQAF | ✓ |  |  |  | 空间条件融合是否有效 |
-| A3 multi-scale uniform average | ✓ | ✓ |  |  | 多尺度本身是否有效 |
-| A4 GSAM | ✓ | ✓ | ✓ |  | 自适应路由是否优于平均融合 |
-| A5 complete model | ✓ | ✓ | ✓ | ✓ | 稳定坐标是否进一步改善结果 |
+| 实验 | SQAF | Modulation pyramid | Scale router | CFHS | 在线 UVW 位姿 | 回答的问题 |
+| --- | --- | --- | --- | --- | --- | --- |
+| A0 TalkingGaussian baseline |  |  |  |  |  | 原始性能 |
+| A1 global/ungated modulation |  |  |  |  |  | 仅增加调制是否有效 |
+| A2 SQAF | ✓ |  |  |  |  | 空间条件融合是否有效 |
+| A3 multi-scale uniform average | ✓ | ✓ |  |  |  | 多尺度本身是否有效 |
+| A4 GSAM | ✓ | ✓ | ✓ |  |  | 自适应路由是否优于平均融合 |
+| A5 QGSFM＋CFHS | ✓ | ✓ | ✓ | ✓ |  | 离线位姿校准是否进一步改善结果 |
+| A6 QGSFM＋CFHS＋在线 UVW | ✓ | ✓ | ✓ | ✓ | ✓ | 训练内位姿校准的增量效果 |
+
+此前五视频位姿消融以相同 QGSFM 配置比较 **A：粗 3DMM、B：CFHS、
+C：CFHS＋双分支交替位姿优化**。此前实验对应表中的 A4/A5/A6，但不代替 SQAF 与
+GSAM 的单独消融。比较 B 与 C 时须保持数据划分、训练预算与评价协议一致。
 
 对应证据建议如下：
 
@@ -935,6 +1040,9 @@ deformation MLP predicts local face motion in the refined coordinate system
 - CFHS：按 yaw 区间报告 LVD、tOF、Flow Warp Error 和 pose acceleration；与粗 3DMM、
   普通轨迹平滑、无连续置信度、无时间约束以及通用/人物/表情不敏感模板对比；重点展示
   ‘转头—遮挡—返回’序列；
+- 固定 UVW 在线优化：报告可绑定 Gaussian 比例、可靠 UVW 像素覆盖率、候选位姿接受率，
+  并对已知旋转/平移扰动直接测量恢复误差；再比较 B/C 的质量与时间指标，尤其检查
+  大 yaw、遮挡及返回片段；
 - 完整模型：PSNR、SSIM、LPIPS、FID、CSIM 等总体指标，以及 lip synchronization 指标。总体
   图像质量与时间稳定性应分别报告，避免单一指标承担全部结论。
 

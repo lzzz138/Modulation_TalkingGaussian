@@ -1,8 +1,13 @@
 import copy
+import contextlib
+import io
 import unittest
+from argparse import ArgumentParser
 from types import SimpleNamespace
+from unittest import mock
 import torch
 from scene.uvw_pose import FixedUVW, PoseTable, robust_binding
+from train_uvw_pose import Runtime, configure_pose_schedule
 
 
 def camera(i=0, device='cpu'):
@@ -12,6 +17,70 @@ def camera(i=0, device='cpu'):
 
 
 class UVWPoseTest(unittest.TestCase):
+    def test_post_topology_schedule_and_legacy_defaults(self):
+        parser = ArgumentParser()
+        new = SimpleNamespace(post_topology_bind=True, topology_freeze_iter=40000,
+                              pose_interval=5, iterations=50000,
+                              pose_start=None, pose_stop=None)
+        configure_pose_schedule(new, parser)
+        self.assertEqual((new.pose_start, new.pose_stop), (40005, 50001))
+        self.assertEqual([i for i in range(39995, 40011)
+                          if new.pose_start <= i < new.pose_stop and i % new.pose_interval == 0],
+                         [40005, 40010])
+        old = SimpleNamespace(post_topology_bind=False, topology_freeze_iter=40000,
+                              pose_interval=5, iterations=50000,
+                              pose_start=None, pose_stop=None)
+        configure_pose_schedule(old, parser)
+        self.assertEqual((old.pose_start, old.pose_stop), (6000, 40000))
+        with contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit):
+                configure_pose_schedule(SimpleNamespace(post_topology_bind=True,
+                    topology_freeze_iter=40000, pose_interval=5, iterations=50000,
+                    pose_start=6000, pose_stop=None), parser)
+
+    def test_new_mode_rejects_old_checkpoint(self):
+        dataset = SimpleNamespace(source_path='unused', model_path='unused')
+        args = SimpleNamespace(post_topology_bind=True, resume='old.pth',
+                               topology_freeze_iter=40000)
+        with mock.patch('train_uvw_pose.preflight', return_value=(None, None, 'digest')):
+            with mock.patch('train_uvw_pose.torch.load', return_value={
+                    'format': 'uvw_pose_v1', 'dataset_digest': 'digest'}):
+                with self.assertRaisesRegex(ValueError, 'Incompatible UVW checkpoint'):
+                    Runtime(dataset, SimpleNamespace(), None, args)
+
+    def test_binding_checkpoint_boundary(self):
+        dataset = SimpleNamespace(source_path='unused', model_path='unused',
+                                  uvw_pose=True, uvw_pose_post_topology=True)
+        options = SimpleNamespace(iterations=50000)
+        args = SimpleNamespace(post_topology_bind=True, resume='new.pth',
+                               topology_freeze_iter=40000, pose_interval=5,
+                               pose_start=40005, pose_stop=50001,
+                               fixed_pose_control=False,
+                               pose_acceleration_delay=500,
+                               pose_acceleration_ramp=1500)
+        template = Runtime.__new__(Runtime)
+        template.dataset, template.options, template.args = dataset, options, args
+        template.post_topology = True
+        config = template.configuration()
+        self.assertEqual(config['face_topology_freeze_iter'], 40000)
+        self.assertNotIn('uvw_pose_post_topology', config['model'])
+        checkpoint = dict(format='uvw_pose_post_topology_v1', dataset_digest='digest',
+                          config=config, iteration=39999, binding_ids=[1],
+                          feature_scale=torch.ones(3),
+                          branches={'face': {'uvw': None,
+                                             'gaussians': (None, torch.zeros(2, 3))}})
+        with mock.patch('train_uvw_pose.preflight', return_value=(None, None, 'digest')):
+            with mock.patch('train_uvw_pose.torch.load', return_value=checkpoint):
+                Runtime(dataset, options, None, args)
+                checkpoint['iteration'] = 40000
+                with self.assertRaisesRegex(ValueError, 'binding state'):
+                    Runtime(dataset, options, None, args)
+                checkpoint['branches']['face']['uvw'] = {'uvw': torch.zeros(2, 3)}
+                Runtime(dataset, options, None, args)
+                checkpoint['branches']['face']['uvw'] = {'uvw': torch.zeros(1, 3)}
+                with self.assertRaisesRegex(ValueError, 'incomplete Face UVW'):
+                    Runtime(dataset, options, None, args)
+
     def test_rollback_and_no_unsampled_drift(self):
         table = PoseTable([camera(2), camera(3)], device='cpu')
         p = table.parameters[2]
@@ -103,7 +172,8 @@ class UVWRenderTest(unittest.TestCase):
         c.FoVx=c.FoVy=.6
         c.image_width=c.image_height=64
         c.projection_matrix=getProjectionMatrix(.01,100,.6,.6).T.cuda()
-        c.full_proj_transform=c.world_view_transform @ c.projection_matrix
+        from data_utils.head_stabilizer.se3 import matrix_multiply
+        c.full_proj_transform=matrix_multiply(c.world_view_transform, c.projection_matrix)
         c.camera_center=-((w[:3,:3].T * w[:3,3][None]).sum(-1))
         pipe=SimpleNamespace(debug=False,compute_cov3D_python=False,convert_SHs_python=False)
         bg=torch.zeros(3,device=device)

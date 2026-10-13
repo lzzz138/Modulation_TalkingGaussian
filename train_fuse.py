@@ -34,6 +34,8 @@ if os.environ.get('TALKING_GAUSSIAN_TENSORBOARD') == '1':
     TENSORBOARD_FOUND = True
 
 def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from):
+    if dataset.uvw_pose_post_topology and not dataset.uvw_pose:
+        raise ValueError('Post-topology Fuse requires --uvw_pose')
     opt.iterations = 10000
     opt.densify_until_iter = 0
 
@@ -57,13 +59,22 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     gaussians.training_setup(opt)
     gaussians_mouth.training_setup(opt)
 
-    joint_path = os.path.join(scene.model_path, 'chkpnt_uvw_latest.pth')
+    joint_name = ('chkpnt_uvw_post_topology_latest.pth' if dataset.uvw_pose_post_topology
+                  else 'chkpnt_uvw_latest.pth')
+    joint_path = os.path.join(scene.model_path, joint_name)
     uvw_checkpoint = None
     if dataset.uvw_pose:
         if not os.path.isfile(joint_path):
-            raise ValueError("UVW mode requires chkpnt_uvw_latest.pth")
+            raise ValueError("UVW mode requires %s" % joint_name)
         from scene.uvw_checkpoint import attach_pose, load_joint
         uvw_checkpoint = torch.load(joint_path)
+        expected_format = ('uvw_pose_post_topology_v1' if dataset.uvw_pose_post_topology
+                           else 'uvw_pose_v1')
+        if not isinstance(uvw_checkpoint, dict) or uvw_checkpoint.get('format') != expected_format:
+            raise ValueError('UVW checkpoint does not match the requested binding schedule')
+        if (dataset.uvw_pose_post_topology
+                and uvw_checkpoint['iteration'] != uvw_checkpoint['config']['iterations']):
+            raise ValueError('Post-topology UVW training must finish before Fuse')
         load_joint(uvw_checkpoint, gaussians, motion_net, gaussians_mouth, motion_net_mouth, opt)
         attach_pose(scene, dataset, uvw_checkpoint)
         for network in (motion_net, motion_net_mouth):
@@ -222,6 +233,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 ckpt = (gaussians.capture(), motion_net.state_dict(), gaussians_mouth.capture(), motion_net_mouth.state_dict())
                 if uvw_checkpoint is not None:
                     ckpt = dict(format='uvw_pose_fuse_v1', iteration=iteration,
+                                binding_schedule=uvw_checkpoint['config'].get('binding_schedule', 'warmup'),
                                 dataset_digest=uvw_checkpoint['dataset_digest'],
                                 pose=uvw_checkpoint['pose'], config=uvw_checkpoint['config'],
                                 binding_ids=uvw_checkpoint['binding_ids'], feature_scale=uvw_checkpoint['feature_scale'],

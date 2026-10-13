@@ -86,6 +86,8 @@ def render_set(model_path, name, iteration, views, gaussians, motion_net, gaussi
 
 
 def render_sets(dataset : ModelParams, iteration : int, pipeline : PipelineParams, use_train : bool, fast, dilate):
+    if getattr(dataset, 'uvw_pose_post_topology', False) and not dataset.uvw_pose:
+        raise ValueError('Post-topology rendering requires --uvw_pose')
     with torch.no_grad():
         gaussians = GaussianModel(dataset.sh_degree)
         gaussians_mouth = GaussianModel(dataset.sh_degree)
@@ -96,6 +98,10 @@ def render_sets(dataset : ModelParams, iteration : int, pipeline : PipelineParam
 
         checkpoint = torch.load(os.path.join(dataset.model_path, 'chkpnt_fuse_latest.pth'))
         if isinstance(checkpoint, dict):
+            expected_schedule = ('post_face_topology'
+                                 if getattr(dataset, 'uvw_pose_post_topology', False) else 'warmup')
+            if checkpoint.get('binding_schedule', 'warmup') != expected_schedule:
+                raise ValueError('Fuse checkpoint binding schedule does not match the requested mode')
             from scene.uvw_checkpoint import load_joint, attach_pose
             load_joint(checkpoint, gaussians, motion_net, gaussians_mouth, motion_net_mouth)
             attach_pose(scene, dataset, checkpoint)

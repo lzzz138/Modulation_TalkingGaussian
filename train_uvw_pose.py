@@ -29,12 +29,27 @@ def corrected_camera(camera, table):
 class Runtime:
     def __init__(self, dataset, options, pipe, args):
         self.dataset, self.options, self.pipe, self.args = dataset, options, pipe, args
+        self.post_topology = bool(args.post_topology_bind)
         self.params, self.cache, self.digest = preflight(dataset.source_path)
         self.resume = torch.load(args.resume, map_location='cuda') if args.resume else None
-        if self.resume and (self.resume.get('format') != 'uvw_pose_v1' or self.resume['dataset_digest'] != self.digest):
+        checkpoint_format = 'uvw_pose_post_topology_v1' if self.post_topology else 'uvw_pose_v1'
+        if self.post_topology and not args.resume and any(os.path.isfile(os.path.join(
+                dataset.model_path, name)) for name in (
+                    'chkpnt_uvw_latest.pth', 'chkpnt_uvw_post_topology_latest.pth')):
+            raise ValueError('Post-topology mode requires a fresh output directory or --resume')
+        if self.resume and (self.resume.get('format') != checkpoint_format or self.resume['dataset_digest'] != self.digest):
             raise ValueError('Incompatible UVW checkpoint or dataset')
-        if self.resume and self.resume['iteration'] >= 3000 and self.resume['branches']['face']['uvw'] is None:
-            raise ValueError('Post-warmup UVW checkpoint is missing fixed bindings')
+        bind_iter = args.topology_freeze_iter if self.post_topology else 3000
+        if self.resume:
+            bound = self.resume['branches']['face']['uvw'] is not None
+            if bound != (self.resume['iteration'] >= bind_iter):
+                raise ValueError('UVW checkpoint binding state disagrees with its iteration')
+            if self.post_topology and bound:
+                face_state = self.resume['branches']['face']
+                if (len(face_state['uvw']['uvw']) != len(face_state['gaussians'][1])
+                        or not self.resume.get('binding_ids')
+                        or self.resume.get('feature_scale') is None):
+                    raise ValueError('Post-topology checkpoint has incomplete Face UVW binding')
         if self.resume and self.resume['config'] != self.configuration():
             raise ValueError('UVW resume training configuration differs')
         self.scene = None
@@ -44,10 +59,11 @@ class Runtime:
         self.log = None
 
     def configuration(self):
-        return dict(iterations=self.options.iterations, interval=self.args.pose_interval,
+        config = dict(iterations=self.options.iterations, interval=self.args.pose_interval,
                     start=self.args.pose_start, stop=self.args.pose_stop,
                     pose_enabled=not self.args.fixed_pose_control,
-                    model={k: v for k, v in vars(self.dataset).items() if k not in ('model_path', 'source_path', 'eval')},
+                    model={k: v for k, v in vars(self.dataset).items()
+                           if k not in ('model_path', 'source_path', 'eval', 'uvw_pose_post_topology')},
                     optimization=vars(self.options).copy(),
                     binding=dict(max_frames=64, yaw_bin_degrees=15, min_observations=5, min_yaw_bins=2, residual_limit=0.05),
                     pose=dict(lr=1e-3, max_degrees=3.0,
@@ -56,6 +72,11 @@ class Runtime:
                               acceleration_delay=self.args.pose_acceleration_delay,
                               acceleration_ramp=self.args.pose_acceleration_ramp,
                               coverage=0.1, min_pixels=512, retention=0.9))
+        if self.post_topology:
+            config.update(binding_schedule='post_face_topology',
+                          face_topology_freeze_iter=self.args.topology_freeze_iter,
+                          bind_iter=self.args.topology_freeze_iter)
+        return config
 
     def make_scene(self, dataset, gaussian, branch):
         if self.scene is None:
@@ -140,7 +161,12 @@ class Runtime:
         gaussian.fixed_uvw = robust_binding(values, weights, torch.tensor(bins, device='cuda'),
                                            gaussian.get_xyz, gaussian.get_scaling.max(-1).values,
                                            self.feature_scale)
-        report = dict(frame_ids=self.binding_ids, yaw_bins=bins, reliable_gaussians=int(gaussian.fixed_uvw.valid.sum()), total_gaussians=len(gaussian.get_xyz), feature_scale=self.feature_scale.cpu().tolist(), config=self.configuration()['binding'])
+        report = dict(frame_ids=self.binding_ids, yaw_bins=bins,
+                      binding_iteration=face['iteration'],
+                      reliable_gaussians=int(gaussian.fixed_uvw.valid.sum()),
+                      total_gaussians=len(gaussian.get_xyz),
+                      feature_scale=self.feature_scale.cpu().tolist(),
+                      config=self.configuration()['binding'])
         with open(os.path.join(self.dataset.model_path, 'uvw_binding.json'), 'w') as stream:
             json.dump(report, stream, indent=2)
         print('Fixed UVW: %d/%d reliable Gaussians' % (gaussian.fixed_uvw.valid.sum(), len(gaussian.get_xyz)))
@@ -189,11 +215,14 @@ class Runtime:
                                   stack=[int(c.talking_dict['img_id']) for c in (s['stack'] or [])],
                                   frozen_gaussians=[k for k in ('_xyz','_opacity','_scaling','_rotation') if not getattr(g,k).requires_grad],
                                   frozen_motion=[n for n,p in s['motion'].named_parameters() if not p.requires_grad])
-        state = dict(format='uvw_pose_v1', iteration=iteration, dataset_digest=self.digest,
+        state = dict(format='uvw_pose_post_topology_v1' if self.post_topology else 'uvw_pose_v1',
+                     iteration=iteration, dataset_digest=self.digest,
                      branches=branches, pose=self.table.state_dict(), binding_ids=self.binding_ids,
                      feature_scale=self.feature_scale, config=self.configuration(),
                      rng=(random.getstate(), np.random.get_state(), torch.get_rng_state(), torch.cuda.get_rng_state_all()))
-        path = os.path.join(self.dataset.model_path, 'chkpnt_uvw_latest.pth')
+        checkpoint_name = ('chkpnt_uvw_post_topology_latest.pth' if self.post_topology
+                           else 'chkpnt_uvw_latest.pth')
+        path = os.path.join(self.dataset.model_path, checkpoint_name)
         torch.save(state, path + '.tmp')
         os.replace(path + '.tmp', path)
         self.export_transforms()
@@ -210,6 +239,22 @@ class Runtime:
             json.dump(document, out, indent=2)
 
 
+def configure_pose_schedule(args, parser):
+    if args.post_topology_bind:
+        if args.pose_start is not None or args.pose_stop is not None:
+            parser.error('post_topology_bind derives the pose window from topology_freeze_iter')
+        if (not 3000 < args.topology_freeze_iter < args.iterations
+                or args.topology_freeze_iter % args.pose_interval):
+            parser.error('topology_freeze_iter must be after warmup, before training ends, and divisible by pose_interval')
+        args.pose_start = args.topology_freeze_iter + args.pose_interval
+        args.pose_stop = args.iterations + 1
+    else:
+        args.pose_start = 6000 if args.pose_start is None else args.pose_start
+        args.pose_stop = 40000 if args.pose_stop is None else args.pose_stop
+    if args.pose_start < 3000 or args.pose_stop <= args.pose_start:
+        parser.error('pose_start must be at least 3000 and smaller than pose_stop')
+
+
 def main():
     parser = ArgumentParser(description=__doc__)
     model = ModelParams(parser)
@@ -222,9 +267,12 @@ def main():
     parser.add_argument('--pose_acceleration_ramp', type=int, default=1500,
                         help='Accepted updates used to ramp acceleration weight to 0.05')
     parser.add_argument('--pose_interval', type=int, default=5)
-    parser.add_argument('--pose_start', type=int, default=6000,
+    parser.add_argument('--pose_start', type=int,
                         help='First training iteration at which online pose updates are enabled')
-    parser.add_argument('--pose_stop', type=int, default=40000)
+    parser.add_argument('--pose_stop', type=int)
+    parser.add_argument('--post_topology_bind', action='store_true',
+                        help='Freeze Face topology at 40k, then bind UVW and optimize pose')
+    parser.add_argument('--topology_freeze_iter', type=int, default=40000)
     parser.add_argument('--fixed_pose_control', action='store_true')
     parser.add_argument('--checkpoint_every', type=int, default=1000)
     args = parser.parse_args()
@@ -232,10 +280,10 @@ def main():
             or args.pose_acceleration_delay < 0
             or args.pose_acceleration_ramp < 0):
         parser.error('intervals must be positive')
-    if args.pose_start < 3000 or args.pose_stop <= args.pose_start:
-        parser.error('pose_start must be at least 3000 and smaller than pose_stop')
+    configure_pose_schedule(args, parser)
     args.eval = False
     args.uvw_pose = True
+    args.uvw_pose_post_topology = args.post_topology_bind
     safe_state(False)
     dataset, options, pipe = model.extract(args), optimization.extract(args), pipeline.extract(args)
     os.makedirs(dataset.model_path, exist_ok=True)
@@ -255,14 +303,24 @@ def main():
         random.setstate(py); np.random.set_state(np_state)
         torch.set_rng_state(cpu.cpu()); torch.cuda.set_rng_state_all([s.cpu() for s in cuda])
     start = states['face']['iteration']
+    face_topology_count = (len(states['face']['gaussians'].get_xyz)
+                           if args.post_topology_bind and start >= args.topology_freeze_iter
+                           else None)
     with open(os.path.join(dataset.model_path, 'pose_updates.jsonl'), 'a') as log:
         last = min(options.iterations, args.stop_after or options.iterations)
         for iteration in range(start + 1, last + 1):
             for branch in generators:
                 states[branch] = next(generators[branch])
                 assert states[branch]['iteration'] == iteration
-            if iteration == 3000:
+            if iteration == (args.topology_freeze_iter if args.post_topology_bind else 3000):
                 runtime.bind(states['face'])
+                if args.post_topology_bind:
+                    face_topology_count = len(states['face']['gaussians'].get_xyz)
+            if args.post_topology_bind and iteration > args.topology_freeze_iter:
+                face_gaussians = states['face']['gaussians']
+                if (len(face_gaussians.get_xyz) != face_topology_count
+                        or len(face_gaussians.fixed_uvw.uvw) != face_topology_count):
+                    raise RuntimeError('Face topology or fixed UVW changed after binding')
             if (args.pose_start <= iteration < args.pose_stop
                     and iteration % args.pose_interval == 0
                     and not args.fixed_pose_control):

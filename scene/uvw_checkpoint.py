@@ -35,7 +35,7 @@ def attach_pose(scene, dataset, checkpoint):
 
 
 def load_joint(checkpoint, gaussians, motion, mouth_gaussians, mouth_motion, opt=None):
-    if checkpoint.get('format') not in ('uvw_pose_v1', 'uvw_pose_fuse_v1'):
+    if checkpoint.get('format') not in ('uvw_pose_v1', 'uvw_pose_post_topology_v1', 'uvw_pose_fuse_v1'):
         raise ValueError('Unsupported UVW checkpoint format')
     for name, g, net in (('face', gaussians, motion), ('mouth', mouth_gaussians, mouth_motion)):
         b = checkpoint['branches'][name]

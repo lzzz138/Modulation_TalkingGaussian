@@ -44,9 +44,11 @@ def training_steps(dataset, opt, pipe, testing_iterations, saving_iterations, ch
 
     # vars
     warm_step = 3000
-    opt.densify_until_iter = opt.iterations - 1000
+    opt.densify_until_iter = (runtime.args.topology_freeze_iter
+                              if runtime is not None and runtime.post_topology
+                              else opt.iterations - 1000)
     bg_iter = opt.iterations # opt.densify_until_iter
-    lpips_start_iter = opt.densify_until_iter - 2000
+    lpips_start_iter = opt.iterations - 3000
     motion_stop_iter = bg_iter
     mouth_select_iter = bg_iter - 10000
     mouth_step = 1 / mouth_select_iter
@@ -302,7 +304,9 @@ def training_steps(dataset, opt, pipe, testing_iterations, saving_iterations, ch
 
             
             # bg prune
-            if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
+            if (iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0
+                    and (runtime is None or not runtime.post_topology
+                         or iteration < runtime.args.topology_freeze_iter)):
                 from utils.sh_utils import eval_sh
 
                 shs_view = gaussians.get_features.transpose(1, 2).view(-1, 3, (gaussians.max_sh_degree+1)**2)
