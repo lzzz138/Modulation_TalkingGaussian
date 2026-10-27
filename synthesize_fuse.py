@@ -88,6 +88,13 @@ def render_set(model_path, name, iteration, views, gaussians, motion_net, gaussi
 def render_sets(dataset : ModelParams, iteration : int, pipeline : PipelineParams, use_train : bool, fast, dilate):
     if getattr(dataset, 'uvw_pose_post_topology', False) and not dataset.uvw_pose:
         raise ValueError('Post-topology rendering requires --uvw_pose')
+    saved_model = torch.load(os.path.join(dataset.model_path, 'chkpnt_fuse_latest.pth'), map_location='cuda')
+    pcv = isinstance(saved_model, dict) and saved_model.get('format') == 'pcv_fuse_v1'
+    if getattr(dataset, 'pose_visibility_deformation', False) and not pcv:
+        raise ValueError('PCV synthesis requires a PCV Fuse checkpoint')
+    if pcv:
+        from utils.pcv_checkpoint import apply_saved_config
+        apply_saved_config(saved_model, dataset)
     with torch.no_grad():
         gaussians = GaussianModel(dataset.sh_degree)
         gaussians_mouth = GaussianModel(dataset.sh_degree)
@@ -96,8 +103,12 @@ def render_sets(dataset : ModelParams, iteration : int, pipeline : PipelineParam
         motion_net = MotionNetwork(args=dataset).cuda()
         motion_net_mouth = MouthMotionNetwork(args=dataset).cuda()
 
-        checkpoint = torch.load(os.path.join(dataset.model_path, 'chkpnt_fuse_latest.pth'))
-        if isinstance(checkpoint, dict):
+        checkpoint = saved_model
+        if pcv:
+            face_g, face_m, mouth_g, mouth_m = checkpoint['models']
+            gaussians.restore(face_g, None); gaussians_mouth.restore(mouth_g, None)
+            motion_net.load_state_dict(face_m, strict=True); motion_net_mouth.load_state_dict(mouth_m, strict=True)
+        elif isinstance(checkpoint, dict):
             expected_schedule = ('post_face_topology'
                                  if getattr(dataset, 'uvw_pose_post_topology', False) else 'warmup')
             if checkpoint.get('binding_schedule', 'warmup') != expected_schedule:

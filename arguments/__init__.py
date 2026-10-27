@@ -56,6 +56,16 @@ class ModelParams(ParamGroup):
         self.eval = False
         self.uvw_pose = False
         self.uvw_pose_post_topology = False
+        self.pose_visibility_deformation = False
+        self.pcv_start = 6000
+        self.pcv_ramp_steps = 3000
+        self.pcv_max_displacement = 0.001
+        self.pcv_visibility_resolution = 128
+        self.pcv_lr = 5e-4
+        self.pcv_reg_weight = 0.001
+        self.pcv_condition = 'pose_visibility'
+        self.pcv_fork_6k = False
+        self.pcv_stop_after = -1
         self.audio = ""
         self.init_num = 10_000
         self.audio_extractor = "deepspeech"

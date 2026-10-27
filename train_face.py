@@ -39,6 +39,16 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
 
 def training_steps(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, runtime=None):
+    pcv = bool(getattr(dataset, 'pose_visibility_deformation', False))
+    if pcv and runtime is not None:
+        raise ValueError('PCV requires independent fixed-camera B training')
+    if pcv:
+        from scene.pose_visibility_deformation import validate_options
+        from utils.pcv_checkpoint import data_identity
+        validate_options(dataset)
+        if not checkpoint and os.path.exists(os.path.join(dataset.model_path, 'chkpnt_face_latest.pth')):
+            raise ValueError('PCV requires a fresh output directory or --start_checkpoint')
+        pcv_identity = data_identity(dataset.source_path)
     testing_iterations = [i for i in range(0, opt.iterations + 1, 2000)]
     checkpoint_iterations =  saving_iterations = [i for i in range(0, opt.iterations + 1, 10000)] + [opt.iterations]
 
@@ -60,6 +70,13 @@ def training_steps(dataset, opt, pipe, testing_iterations, saving_iterations, ch
     gaussians = GaussianModel(dataset.sh_degree)
     scene = Scene(dataset, gaussians) if runtime is None else runtime.make_scene(dataset, gaussians, 'face')
 
+    if pcv:
+        import json
+        from scene.pose_visibility_deformation import yaw_groups
+        pcv_yaw_metadata, pcv_yaw_by_id = yaw_groups(scene.getTrainCameras())
+        with open(os.path.join(scene.model_path, 'pcv_yaw_bins.json'), 'w') as stream:
+            json.dump(pcv_yaw_metadata, stream, indent=2)
+
     motion_net = MotionNetwork(args=dataset).cuda()
     print("Face multi-scale modulation: {}".format(
         "adaptive-8/16/32" if motion_net.geometry_mod_multiscale else "fixed-16"
@@ -70,7 +87,7 @@ def training_steps(dataset, opt, pipe, testing_iterations, saving_iterations, ch
     lpips_criterion = lpips.LPIPS(net='alex').eval().cuda()
 
     gaussians.training_setup(opt)
-    if checkpoint:
+    if checkpoint and not pcv:
         (model_params, motion_params, motion_optimizer_params, first_iter) = torch.load(checkpoint)
         gaussians.restore(model_params, opt)
         motion_net.validate_multiscale_checkpoint(motion_params)
@@ -91,6 +108,10 @@ def training_steps(dataset, opt, pipe, testing_iterations, saving_iterations, ch
     iter_end = torch.cuda.Event(enable_timing = True)
 
     viewpoint_stack = None if runtime is None else saved_stack
+    if pcv and checkpoint:
+        from utils.pcv_checkpoint import restore_face
+        first_iter, viewpoint_stack = restore_face(torch.load(checkpoint), dataset, opt, scene,
+            gaussians, motion_net, motion_optimizer, scheduler, pcv_identity)
     ema_loss_for_log = 0.0
     progress_bar = tqdm(range(first_iter, opt.iterations), ascii=True, dynamic_ncols=True, desc="Training progress")
     if runtime is not None:
@@ -99,6 +120,13 @@ def training_steps(dataset, opt, pipe, testing_iterations, saving_iterations, ch
     first_iter += 1
     for iteration in range(first_iter, opt.iterations + 1):        
 
+        if pcv:
+            motion_net.pose_residual.set_iteration(iteration, dataset.pcv_start, dataset.pcv_ramp_steps)
+            if iteration > motion_stop_iter:
+                motion_net.requires_grad_(False)
+            motion_net.pcv_profile = iteration % 200 == 0
+            if motion_net.pcv_profile:
+                torch.cuda.reset_peak_memory_stats()
         iter_start.record()
 
         gaussians.update_learning_rate(iteration)
@@ -256,7 +284,19 @@ def training_steps(dataset, opt, pipe, testing_iterations, saving_iterations, ch
             # loss += 0.5 * lpips_criterion(image_t[None, ...] * 2 - 1, gt_image_t[None, ...] * 2 - 1).mean()
 
 
+        if pcv and iteration >= warm_step:
+            loss = loss + dataset.pcv_reg_weight * motion_net.pose_residual.strength * render_pkg['motion']['pcv_regularization']
         loss.backward()
+        if pcv and iteration % 200 == 0 and iteration >= warm_step:
+            import json, math
+            diagnostics = {k: float(v) for k, v in render_pkg['motion'].get('pcv_diagnostics', {}).items()}
+            rot = viewpoint_cam.world_view_transform[:3, :3]
+            diagnostics.update(iteration=iteration, img_id=int(viewpoint_cam.talking_dict['img_id']),
+                               yaw_degrees=math.degrees(math.atan2(float(rot[0, 2]), float(rot[2, 2]))),
+                               peak_memory_mb=torch.cuda.max_memory_allocated()/1024**2)
+            diagnostics.update(pcv_yaw_by_id[int(viewpoint_cam.talking_dict['img_id'])])
+            with open(os.path.join(scene.model_path, 'pcv_diagnostics.jsonl'), 'a') as stream:
+                stream.write(json.dumps(diagnostics)+'\n')
 
         iter_end.record()
 
@@ -285,7 +325,7 @@ def training_steps(dataset, opt, pipe, testing_iterations, saving_iterations, ch
                 print("\n[ITER {}] Saving Gaussians".format(iteration))
                 scene.save(str(iteration)+'_face')
 
-            if runtime is None and (iteration in checkpoint_iterations):
+            if runtime is None and not pcv and (iteration in checkpoint_iterations):
                 print("\n[ITER {}] Saving Checkpoint".format(iteration))
                 ckpt = (gaussians.capture(), motion_net.state_dict(), motion_optimizer.state_dict(), iteration)
                 torch.save(ckpt, scene.model_path + "/chkpnt_face_" + str(iteration) + ".pth")
@@ -329,6 +369,14 @@ def training_steps(dataset, opt, pipe, testing_iterations, saving_iterations, ch
 
                 scheduler.step()
 
+        if pcv and (iteration in checkpoint_iterations or iteration in (3000, 6000) or iteration == dataset.pcv_stop_after):
+            from utils.pcv_checkpoint import save_face, atomic_save
+            state = save_face(os.path.join(scene.model_path, 'chkpnt_face_latest.pth'), dataset, opt,
+                              scene, gaussians, motion_net, motion_optimizer, scheduler, iteration,
+                              viewpoint_stack, pcv_identity)
+            atomic_save(state, os.path.join(scene.model_path, 'chkpnt_face_'+str(iteration)+'.pth'))
+        if pcv and iteration == dataset.pcv_stop_after:
+            break
         if runtime is not None:
             yield dict(branch='face', iteration=iteration, gaussians=gaussians, motion=motion_net,
                        optimizer=motion_optimizer, scheduler=scheduler, stack=viewpoint_stack)

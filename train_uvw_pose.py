@@ -63,7 +63,8 @@ class Runtime:
                     start=self.args.pose_start, stop=self.args.pose_stop,
                     pose_enabled=not self.args.fixed_pose_control,
                     model={k: v for k, v in vars(self.dataset).items()
-                           if k not in ('model_path', 'source_path', 'eval', 'uvw_pose_post_topology')},
+                           if k not in ('model_path', 'source_path', 'eval', 'uvw_pose_post_topology', 'pose_visibility_deformation')
+                           and not k.startswith('pcv_')},
                     optimization=vars(self.options).copy(),
                     binding=dict(max_frames=64, yaw_bin_degrees=15, min_observations=5, min_yaw_bins=2, residual_limit=0.05),
                     pose=dict(lr=1e-3, max_degrees=3.0,
@@ -276,6 +277,8 @@ def main():
     parser.add_argument('--fixed_pose_control', action='store_true')
     parser.add_argument('--checkpoint_every', type=int, default=1000)
     args = parser.parse_args()
+    if args.pose_visibility_deformation:
+        parser.error('PCV-DF requires fixed-camera train_face.py, not online UVW pose training')
     if (args.pose_interval < 1 or args.checkpoint_every < 1
             or args.pose_acceleration_delay < 0
             or args.pose_acceleration_ramp < 0):

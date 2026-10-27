@@ -324,6 +324,15 @@ class MotionNetwork(nn.Module):
         self.sigma_net = MLP(self.in_dim + self.audio_dim + self.eye_dim + self.individual_dim, self.out_dim, self.hidden_dim, self.num_layers)
         
         self.aud_ch_att_net = MLP(self.in_dim, self.audio_dim, 32, 2)
+        self.pose_visibility_deformation = bool(getattr(args, 'pose_visibility_deformation', False))
+        if self.pose_visibility_deformation:
+            from scene.pose_visibility_deformation import PoseVisibilityResidual, validate_options
+            validate_options(args)
+            with torch.random.fork_rng(devices=[]):
+                torch.random.default_generator.manual_seed(0)
+                self.pose_residual = PoseVisibilityResidual(args)
+            self.pcv_lr = args.pcv_lr
+
 
 
     @staticmethod
@@ -484,7 +493,7 @@ class MotionNetwork(nn.Module):
         d_rot = h[..., 3:7]
         d_opa = h[..., 7:8]
         d_scale = h[..., 8:11]
-        return {
+        result = {
             'd_xyz': d_xyz,
             'd_rot': d_rot,
             'd_opa': d_opa,
@@ -499,6 +508,10 @@ class MotionNetwork(nn.Module):
                 else x.new_tensor([0.0, 1.0, 0.0])
             ),
         }
+
+        if self.pose_visibility_deformation:
+            result['pcv_features'] = torch.cat((enc_x_dyn, enc_a, enc_e_global.expand(len(x), -1)), -1)
+        return result
 
 
     # optimizer utils
@@ -526,6 +539,8 @@ class MotionNetwork(nn.Module):
         params.append({'params': self.eye_att_net.parameters(), 'lr': lr_net, 'weight_decay': wd})
         params.append({'params': self.exp_encode_net.parameters(), 'lr': lr_net, 'weight_decay': wd})
 
+        if self.pose_visibility_deformation:
+            params.append({'params': self.pose_residual.parameters(), 'lr': self.pcv_lr, 'weight_decay': 0.0})
         return params
 
 

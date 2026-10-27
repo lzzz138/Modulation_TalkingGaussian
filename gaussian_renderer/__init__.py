@@ -159,6 +159,12 @@ def render_motion(viewpoint_camera, pc : GaussianModel, motion_net : MotionNetwo
     # scales = pc.get_scaling
     scales = pc.scaling_activation(pc._scaling + motion_preds['d_scale'])
     rotations = pc.rotation_activation(pc._rotation + motion_preds['d_rot'])
+    if getattr(motion_net, 'pose_visibility_deformation', False):
+        from scene.pose_visibility_deformation import apply_pose_residual
+        motion_preds = apply_pose_residual(viewpoint_camera, pc, motion_net, motion_preds,
+                                          scales, rotations, scaling_modifier, pipe.debug)
+        means3D = pc.get_xyz + motion_preds['d_xyz']
+
 
     colors_precomp = None
     shs = pc.get_features

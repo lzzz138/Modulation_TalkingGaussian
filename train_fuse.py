@@ -34,13 +34,27 @@ if os.environ.get('TALKING_GAUSSIAN_TENSORBOARD') == '1':
     TENSORBOARD_FOUND = True
 
 def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from):
+    pcv_face = torch.load(os.path.join(dataset.model_path, 'chkpnt_face_latest.pth'), map_location='cpu') if not dataset.uvw_pose else None
+    pcv = isinstance(pcv_face, dict) and pcv_face.get('format') == 'pcv_face_v1'
+    if getattr(dataset, 'pose_visibility_deformation', False) and not pcv:
+        raise ValueError('PCV Fuse requires a completed PCV Face checkpoint')
+    if pcv:
+        from utils.pcv_checkpoint import apply_saved_config, data_identity, validate_mouth
+        apply_saved_config(pcv_face, dataset)
+        pcv_face = torch.load(os.path.join(dataset.model_path, 'chkpnt_face_latest.pth'), map_location='cuda')
+        pcv_identity = data_identity(dataset.source_path)
+        if pcv_face['identity'] != pcv_identity or pcv_face['iteration'] != pcv_face['optimization']['iterations']:
+            raise ValueError('PCV Face training is incomplete or belongs to different data')
+        pcv_mouth = validate_mouth(os.path.join(dataset.model_path, 'chkpnt_mouth_latest.pth'), dataset.source_path, device='cuda')
+    if not pcv:
+        pcv_face = None
     if dataset.uvw_pose_post_topology and not dataset.uvw_pose:
         raise ValueError('Post-topology Fuse requires --uvw_pose')
     opt.iterations = 10000
     opt.densify_until_iter = 0
 
     testing_iterations = [i for i in range(0, opt.iterations + 1, 2000)]
-    checkpoint_iterations = [opt.iterations]
+    checkpoint_iterations = list(range(1000, opt.iterations+1, 1000)) if pcv else [opt.iterations]
 
     # vars
     bg_iter = opt.densify_until_iter
@@ -80,6 +94,11 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         for network in (motion_net, motion_net_mouth):
             for parameter in network.parameters():
                 parameter.requires_grad_(False)
+    elif pcv:
+        gaussians.restore(pcv_face['gaussians'], opt)
+        motion_net.load_state_dict(pcv_face['motion'], strict=True)
+        gaussians_mouth.restore(pcv_mouth[0], opt)
+        motion_net_mouth.load_state_dict(pcv_mouth[1], strict=True)
     else:
         (model_params, motion_params, _, _) = torch.load(os.path.join(scene.model_path, "chkpnt_face_latest.pth"))
         gaussians.restore(model_params, opt)
@@ -100,6 +119,23 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     iter_end = torch.cuda.Event(enable_timing = True)
 
     viewpoint_stack = None
+    if pcv and checkpoint:
+        from utils.pcv_checkpoint import config, restore_sampling
+        saved = torch.load(checkpoint)
+        if saved.get('format') != 'pcv_fuse_v1' or saved['config'] != config(dataset) or saved['identity'] != pcv_identity or saved['optimization'] != vars(opt):
+            raise ValueError('PCV Fuse resume configuration/data mismatch')
+        face_g, face_m, mouth_g, mouth_m = saved['models']
+        gaussians.restore(face_g, opt); gaussians_mouth.restore(mouth_g, opt)
+        motion_net.load_state_dict(face_m, strict=True); motion_net_mouth.load_state_dict(mouth_m, strict=True)
+        first_iter = saved['iteration']
+        viewpoint_stack = restore_sampling(scene, saved['sampling'])
+    if pcv:
+        for network in (motion_net, motion_net_mouth):
+            network.requires_grad_(False)
+        for gaussian in (gaussians, gaussians_mouth):
+            for name in ('_xyz', '_scaling', '_rotation'):
+                getattr(gaussian, name).requires_grad_(False)
+        gaussians_mouth._opacity.requires_grad_(False)
     ema_loss_for_log = 0.0
     progress_bar = tqdm(range(first_iter, opt.iterations), ascii=True, dynamic_ncols=True, desc="Training progress")
     first_iter += 1
@@ -240,6 +276,11 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                                 branches={
                                     'face': dict(gaussians=gaussians.capture(), motion=motion_net.state_dict(), uvw=gaussians.fixed_uvw.state_dict()),
                                     'mouth': dict(gaussians=gaussians_mouth.capture(), motion=motion_net_mouth.state_dict(), uvw=None)})
+                if pcv:
+                    from utils.pcv_checkpoint import config, sampling
+                    ckpt = dict(format='pcv_fuse_v1', config=config(dataset), identity=pcv_identity,
+                                optimization=vars(opt).copy(), models=ckpt, iteration=iteration,
+                                sampling=sampling(scene, viewpoint_stack))
                 torch.save(ckpt, scene.model_path + "/chkpnt_fuse_" + str(iteration) + ".pth")
                 torch.save(ckpt, scene.model_path + "/chkpnt_fuse_latest" + ".pth")
 
